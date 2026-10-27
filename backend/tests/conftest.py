@@ -69,4 +69,7 @@ def meta_model_api_env(request: pytest.FixtureRequest, monkeypatch: pytest.Monke
     monkeypatch.setenv("STORAGE_ACCESS_KEY", "test-fake-access-key")
     monkeypatch.setenv("STORAGE_SECRET_KEY", "test-fake-secret-key")
     monkeypatch.setenv("STORAGE_BUCKET", "test-fake-bucket")
+    monkeypatch.setenv("CALIPER_API_KEY", "test-fake-caliper-api-key")
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://test:test@localhost/test")
+    monkeypatch.setenv("VALKEY_URL", "redis://localhost:6379/0")
     yield
