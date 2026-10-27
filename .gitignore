@@ -23,6 +23,7 @@ htmlcov/
 *.db
 *.sqlite
 *.sqlite3
+requirements.scan.txt
 secrets/
 postgres-data/
 valkey-data/
