@@ -1,19 +1,46 @@
-"""FastAPI application skeleton.
+"""FastAPI application: health check (Module 1) plus the Module 4 API
+orchestration layer mounted alongside it.
 
-Per the brief for this module, the HTTP surface is intentionally minimal:
-a health-check endpoint only. Request/response orchestration for the
-classification engine, auth, and rate limiting belongs to the
-``api-gateway`` module boundary described in architecture.md and is out
-of scope until Module 4 ("API orchestration and the demo-facing UI").
+Startup wires up the two I/O-performing dependencies the API route
+needs -- an async SQLAlchemy session factory (for audit logging) and a
+Valkey client (for rate limiting) -- and stores them on
+``app.state`` so ``backend/app/api/routes.py`` can reach them without
+constructing its own engine or client per request. Shutdown disposes
+both cleanly.
 
-This module performs I/O by nature (it's a web server) and must stay
-separate from ``app.classification.engine``, which must not.
+Known gap, stated explicitly rather than silently built around: this
+module does not persist full ``ClassificationResult`` objects to the
+database. ``AuditLogEntry.classification_result_id`` is always written
+as ``None`` here -- see ``backend/app/api/routes.py`` and
+reports/module-4-report.md.
 """
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from pydantic import BaseModel
+
+from app.api.errors import register_exception_handlers
+from app.api.routes import router as api_v1_router
+from app.db import build_engine, build_session_factory
+from app.valkey_client import build_valkey_client
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    engine = build_engine()
+    app.state.db_engine = engine
+    app.state.db_session_factory = build_session_factory(engine)
+    app.state.valkey_client = build_valkey_client()
+
+    try:
+        yield
+    finally:
+        await app.state.valkey_client.aclose()
+        await engine.dispose()
+
 
 app = FastAPI(
     title="Caliper",
@@ -23,7 +50,11 @@ app = FastAPI(
         "architecture.md at the repository root."
     ),
     version="0.1.0",
+    lifespan=_lifespan,
 )
+
+register_exception_handlers(app)
+app.include_router(api_v1_router)
 
 
 class HealthResponse(BaseModel):
@@ -35,8 +66,8 @@ class HealthResponse(BaseModel):
 @app.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     """Liveness/readiness probe. No dependency checks (DB, Valkey) are
-    performed here yet -- this is intentionally the minimal Module 1
-    skeleton, not a full readiness probe.
+    performed here -- this stays the minimal Module 1 skeleton, not a
+    full readiness probe, even with the API routes now mounted.
     """
 
     return HealthResponse(status="ok")
