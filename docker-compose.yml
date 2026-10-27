@@ -8,6 +8,12 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://caliper:caliper@postgres:5432/caliper}
       VALKEY_URL: ${VALKEY_URL:-redis://valkey:6379/0}
       META_MODEL_API_KEY: ${META_MODEL_API_KEY:-}
+      SAM_MODEL_ID: ${SAM_MODEL_ID:-sam-3.1}
+      MUSE_SPARK_MODEL_ID: ${MUSE_SPARK_MODEL_ID:-muse-spark-1.3}
+      STORAGE_ENDPOINT_URL: ${STORAGE_ENDPOINT_URL:-}
+      STORAGE_ACCESS_KEY: ${STORAGE_ACCESS_KEY:-}
+      STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY:-}
+      STORAGE_BUCKET: ${STORAGE_BUCKET:-}
     depends_on:
       postgres:
         condition: service_healthy
