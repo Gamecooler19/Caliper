@@ -111,6 +111,15 @@ STORAGE_BUCKET = SecretSpec(
     "device media.",
 )
 
+CALIPER_API_KEY = SecretSpec(
+    env_var="CALIPER_API_KEY",
+    required=True,
+    description="Shared API key for the Caliper HTTP API. Checked via "
+    "the X-API-Key header on every route under /api/v1. This deployment "
+    "model is a single shared key, not per-user accounts -- TOTP MFA "
+    "and RBAC are explicitly out of scope for Module 4.",
+)
+
 
 def load_secret(spec: SecretSpec) -> str | None:
     """Read one secret from the environment according to its
@@ -212,5 +221,13 @@ def load_storage_bucket() -> str:
     """Load the S3-compatible object storage bucket name. Raises if unset."""
 
     value = load_secret(STORAGE_BUCKET)
+    assert value is not None  # required=True guarantees this or a raise above
+    return value
+
+
+def load_caliper_api_key() -> str:
+    """Load the shared Caliper API key. Raises if unset."""
+
+    value = load_secret(CALIPER_API_KEY)
     assert value is not None  # required=True guarantees this or a raise above
     return value
