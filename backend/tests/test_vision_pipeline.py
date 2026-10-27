@@ -1,10 +1,10 @@
 """Tests for the vision pipeline: app.vision.client and app.vision.pipeline.
 
-Covers, per the Module 2 brief:
+Covers, per the Module 2 brief (still true after the Module 3 refactor):
 
 - A successful end-to-end mocked extraction through
   ``extract_vision_flags`` (SAM segmentation + Muse Spark structured
-  output, both mocked via respx).
+  output).
 - Each of the three named client exception cases
   (:class:`MetaModelAPIError`, :class:`MetaModelAPIResponseError`,
   :class:`MetaModelAPITimeoutError`) propagating out of
@@ -12,33 +12,51 @@ Covers, per the Module 2 brief:
 - A regression run of Module 1's zero-I/O AST check against the
   classification package, confirming this module didn't weaken it.
 
-Every test in this file runs against mocked HTTP responses via respx
-(see ``conftest.py``'s autouse ``no_real_network_calls`` fixture); none
-of them reach api.meta.ai or object storage over the real network.
+Module 3 change: the three exception types and the raw Responses API
+transport moved to the shared ``app.meta_api.client`` (tested directly
+in ``test_meta_api_client.py``). These tests now mock
+``app.vision.client.create_response`` -- the shared client function
+``segment_concept()`` and ``understand_image_structured()`` call --
+instead of mocking raw httpx/respx at the HTTP layer. Every assertion
+present before the refactor is still made here, unchanged; only the
+mocking mechanism moved up a layer, matching where the real boundary
+now is. ``upload_file()`` was never vision-specific and its tests now
+live solely in ``test_meta_api_client.py``, since it moved there too.
+
+Every test in this file still runs inside ``conftest.py``'s autouse
+``no_real_network_calls`` respx-mock context; none of them make a real
+httpx call, so none can reach api.meta.ai over the real network.
 """
 
 from __future__ import annotations
 
 import io
 import json
+from unittest.mock import AsyncMock
 
-import httpx
 import pytest
 from PIL import Image
 
 from app.classification.models import VisionFlags
-from app.vision.client import (
+from app.meta_api.client import (
     MetaModelAPIError,
     MetaModelAPIResponseError,
     MetaModelAPITimeoutError,
-    segment_concept,
-    understand_image_structured,
-    upload_file,
 )
+from app.vision.client import segment_concept, understand_image_structured
 from app.vision.pipeline import extract_vision_flags
 
-RESPONSES_URL = "https://api.meta.ai/v1/responses"
-FILES_URL = "https://api.meta.ai/v1/files"
+
+def _mock_create_response(monkeypatch: pytest.MonkeyPatch, **kwargs) -> AsyncMock:
+    """Replace ``app.vision.client.create_response`` (the shared client
+    function ``segment_concept``/``understand_image_structured`` call)
+    with an :class:`AsyncMock`, configured via ``**kwargs`` (typically
+    ``return_value`` or ``side_effect``).
+    """
+
+    mock = AsyncMock(**kwargs)
+    monkeypatch.setattr("app.vision.client.create_response", mock)
+    return mock
 
 
 def _sample_image_bytes(width: int = 200, height: int = 150) -> bytes:
@@ -62,52 +80,14 @@ def _sam_output_text(box: tuple[int, int, int, int, int, int]) -> str:
     return f"<0f>0<|box;x1={x1};y1={y1};x2={x2};y2={y2};w={w};h={h}|>"
 
 
-def _responses_body(output_text: str) -> dict:
-    """Build a representative non-streaming Responses API body, per the
-    quickstart's documented response shape.
-    """
-
-    return {
-        "id": "resp_test123",
-        "object": "response",
-        "created_at": 1792177394,
-        "status": "completed",
-        "model": "sam-3.1",
-        "output": [
-            {
-                "id": "msg_test123",
-                "type": "message",
-                "role": "assistant",
-                "status": "completed",
-                "content": [
-                    {
-                        "type": "output_text",
-                        "text": output_text,
-                        "annotations": [],
-                    }
-                ],
-            }
-        ],
-        "usage": {"input_tokens": 10, "output_tokens": 10, "total_tokens": 20},
-    }
-
-
-def _error_envelope(message: str, error_type: str, code: str | None = None) -> dict:
-    """Build the documented Meta Model API error envelope."""
-
-    return {"error": {"message": message, "type": error_type, "param": None, "code": code}}
-
-
 # ---------------------------------------------------------------------------
 # segment_concept
 # ---------------------------------------------------------------------------
 
 
-async def test_segment_concept_parses_box_from_output_text(respx_router):
-    respx_router.post(RESPONSES_URL).mock(
-        return_value=httpx.Response(
-            200, json=_responses_body(_sam_output_text((10, 20, 110, 120, 200, 150)))
-        )
+async def test_segment_concept_parses_box_from_output_text(monkeypatch):
+    _mock_create_response(
+        monkeypatch, return_value=_sam_output_text((10, 20, 110, 120, 200, 150))
     )
 
     boxes = await segment_concept(_sample_image_bytes(), "medical device", model="sam-3.1")
@@ -121,14 +101,12 @@ async def test_segment_concept_parses_box_from_output_text(respx_router):
     assert boxes[0].h == 150
 
 
-async def test_segment_concept_zero_matches_returns_empty_list(respx_router):
+async def test_segment_concept_zero_matches_returns_empty_list(monkeypatch):
     """Per the SAM docs, zero matches is a valid outcome (empty output_text),
     not an error.
     """
 
-    respx_router.post(RESPONSES_URL).mock(
-        return_value=httpx.Response(200, json=_responses_body(""))
-    )
+    _mock_create_response(monkeypatch, return_value="")
 
     boxes = await segment_concept(_sample_image_bytes(), "medical device", model="sam-3.1")
 
@@ -140,16 +118,12 @@ async def test_segment_concept_zero_matches_returns_empty_list(respx_router):
 # ---------------------------------------------------------------------------
 
 
-async def test_understand_image_structured_parses_json_output(respx_router):
+async def test_understand_image_structured_parses_json_output(monkeypatch):
     payload = {
         "visual_evidence_implantable": True,
         "visual_evidence_duration_conflict": False,
     }
-    respx_router.post(RESPONSES_URL).mock(
-        return_value=httpx.Response(
-            200, json=_responses_body(json.dumps(payload))
-        )
-    )
+    _mock_create_response(monkeypatch, return_value=json.dumps(payload))
 
     result = await understand_image_structured(
         _sample_image_bytes(),
@@ -162,81 +136,15 @@ async def test_understand_image_structured_parses_json_output(respx_router):
     assert result == payload
 
 
-# ---------------------------------------------------------------------------
-# upload_file
-# ---------------------------------------------------------------------------
-
-
-async def test_upload_file_returns_parsed_response(respx_router):
-    respx_router.post(FILES_URL).mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "id": "file-842549258569145",
-                "object": "file",
-                "bytes": 245832,
-                "created_at": 1714502400,
-                "filename": "photo.png",
-                "purpose": "user_data",
-                "status": "uploaded",
-            },
-        )
-    )
-
-    result = await upload_file(_sample_image_bytes(), "photo.png")
-
-    assert result["id"] == "file-842549258569145"
-    assert result["status"] == "uploaded"
-
-
-# ---------------------------------------------------------------------------
-# Named exception cases (client layer)
-# ---------------------------------------------------------------------------
-
-
-async def test_segment_concept_raises_api_error_on_error_response(respx_router):
-    respx_router.post(RESPONSES_URL).mock(
-        return_value=httpx.Response(
-            401,
-            json=_error_envelope(
-                "Incorrect API key provided.", "invalid_request_error", "invalid_api_key"
-            ),
-        )
-    )
-
-    with pytest.raises(MetaModelAPIError) as exc_info:
-        await segment_concept(_sample_image_bytes(), "medical device", model="sam-3.1")
-
-    assert exc_info.value.status_code == 401
-    assert exc_info.value.error_code == "invalid_api_key"
-
-
-async def test_segment_concept_raises_response_error_on_malformed_body(respx_router):
-    """A 2xx response missing the documented 'output' field is malformed,
-    not a guessable default.
+async def test_understand_image_structured_raises_response_error_on_invalid_json(
+    monkeypatch,
+):
+    """The output_text's JSON parsing is vision-pipeline-local logic (not
+    part of the shared client), so this exercises the real parsing path:
+    the mocked create_response returns a text string, not an exception.
     """
 
-    respx_router.post(RESPONSES_URL).mock(
-        return_value=httpx.Response(200, json={"id": "resp_test123", "status": "completed"})
-    )
-
-    with pytest.raises(MetaModelAPIResponseError):
-        await segment_concept(_sample_image_bytes(), "medical device", model="sam-3.1")
-
-
-async def test_segment_concept_raises_timeout_error(respx_router):
-    respx_router.post(RESPONSES_URL).mock(side_effect=httpx.TimeoutException("timed out"))
-
-    with pytest.raises(MetaModelAPITimeoutError):
-        await segment_concept(_sample_image_bytes(), "medical device", model="sam-3.1")
-
-
-async def test_understand_image_structured_raises_response_error_on_invalid_json(
-    respx_router,
-):
-    respx_router.post(RESPONSES_URL).mock(
-        return_value=httpx.Response(200, json=_responses_body("not valid json {"))
-    )
+    _mock_create_response(monkeypatch, return_value="not valid json {")
 
     with pytest.raises(MetaModelAPIResponseError):
         await understand_image_structured(
@@ -249,34 +157,71 @@ async def test_understand_image_structured_raises_response_error_on_invalid_json
 
 
 # ---------------------------------------------------------------------------
+# Named exception cases (client layer): create_response raising
+# propagates straight through segment_concept / understand_image_structured.
+# ---------------------------------------------------------------------------
+
+
+async def test_segment_concept_raises_api_error_on_error_response(monkeypatch):
+    _mock_create_response(
+        monkeypatch,
+        side_effect=MetaModelAPIError(
+            status_code=401,
+            message="Incorrect API key provided.",
+            error_type="invalid_request_error",
+            error_code="invalid_api_key",
+        ),
+    )
+
+    with pytest.raises(MetaModelAPIError) as exc_info:
+        await segment_concept(_sample_image_bytes(), "medical device", model="sam-3.1")
+
+    assert exc_info.value.status_code == 401
+    assert exc_info.value.error_code == "invalid_api_key"
+
+
+async def test_segment_concept_raises_response_error_on_malformed_body(monkeypatch):
+    """A malformed Responses API body is detected and raised by the
+    shared client; segment_concept must propagate it uncaught.
+    """
+
+    _mock_create_response(
+        monkeypatch,
+        side_effect=MetaModelAPIResponseError("Responses API body was malformed"),
+    )
+
+    with pytest.raises(MetaModelAPIResponseError):
+        await segment_concept(_sample_image_bytes(), "medical device", model="sam-3.1")
+
+
+async def test_segment_concept_raises_timeout_error(monkeypatch):
+    _mock_create_response(
+        monkeypatch, side_effect=MetaModelAPITimeoutError("timed out")
+    )
+
+    with pytest.raises(MetaModelAPITimeoutError):
+        await segment_concept(_sample_image_bytes(), "medical device", model="sam-3.1")
+
+
+# ---------------------------------------------------------------------------
 # extract_vision_flags: end-to-end success and exception propagation
 # ---------------------------------------------------------------------------
 
 
-async def test_extract_vision_flags_end_to_end_success(respx_router):
+async def test_extract_vision_flags_end_to_end_success(monkeypatch):
     """SAM finds a box, Muse Spark returns structured flags on the crop."""
 
-    sam_route = respx_router.post(RESPONSES_URL)
-    sam_route.mock(
+    mock = _mock_create_response(
+        monkeypatch,
         side_effect=[
-            httpx.Response(
-                200,
-                json=_responses_body(
-                    _sam_output_text((10, 10, 100, 100, 200, 150))
-                ),
+            _sam_output_text((10, 10, 100, 100, 200, 150)),
+            json.dumps(
+                {
+                    "visual_evidence_implantable": False,
+                    "visual_evidence_duration_conflict": None,
+                }
             ),
-            httpx.Response(
-                200,
-                json=_responses_body(
-                    json.dumps(
-                        {
-                            "visual_evidence_implantable": False,
-                            "visual_evidence_duration_conflict": None,
-                        }
-                    )
-                ),
-            ),
-        ]
+        ],
     )
 
     result = await extract_vision_flags(_sample_image_bytes())
@@ -284,46 +229,40 @@ async def test_extract_vision_flags_end_to_end_success(respx_router):
     assert isinstance(result, VisionFlags)
     assert result.visual_evidence_implantable is False
     assert result.visual_evidence_duration_conflict is None
-    assert sam_route.call_count == 2
+    assert mock.await_count == 2
 
 
 async def test_extract_vision_flags_no_segmentation_match_still_calls_muse_spark(
-    respx_router,
+    monkeypatch,
 ):
     """Zero SAM matches is not an error: the pipeline falls back to the
     full image for the Muse Spark call rather than failing.
     """
 
-    route = respx_router.post(RESPONSES_URL)
-    route.mock(
+    mock = _mock_create_response(
+        monkeypatch,
         side_effect=[
-            httpx.Response(200, json=_responses_body("")),
-            httpx.Response(
-                200,
-                json=_responses_body(
-                    json.dumps(
-                        {
-                            "visual_evidence_implantable": None,
-                            "visual_evidence_duration_conflict": None,
-                        }
-                    )
-                ),
+            "",
+            json.dumps(
+                {
+                    "visual_evidence_implantable": None,
+                    "visual_evidence_duration_conflict": None,
+                }
             ),
-        ]
+        ],
     )
 
     result = await extract_vision_flags(_sample_image_bytes())
 
     assert result.visual_evidence_implantable is None
     assert result.visual_evidence_duration_conflict is None
-    assert route.call_count == 2
+    assert mock.await_count == 2
 
 
-async def test_extract_vision_flags_propagates_api_error_from_sam_step(respx_router):
-    respx_router.post(RESPONSES_URL).mock(
-        return_value=httpx.Response(
-            500, json=_error_envelope("Internal server error.", "server_error")
-        )
+async def test_extract_vision_flags_propagates_api_error_from_sam_step(monkeypatch):
+    _mock_create_response(
+        monkeypatch,
+        side_effect=MetaModelAPIError(status_code=500, message="Internal server error."),
     )
 
     with pytest.raises(MetaModelAPIError):
@@ -331,22 +270,21 @@ async def test_extract_vision_flags_propagates_api_error_from_sam_step(respx_rou
 
 
 async def test_extract_vision_flags_propagates_response_error_from_muse_spark_step(
-    respx_router,
+    monkeypatch,
 ):
-    route = respx_router.post(RESPONSES_URL)
-    route.mock(
-        side_effect=[
-            httpx.Response(200, json=_responses_body("")),
-            httpx.Response(200, json=_responses_body("not valid json {")),
-        ]
+    _mock_create_response(
+        monkeypatch,
+        side_effect=["", "not valid json {"],
     )
 
     with pytest.raises(MetaModelAPIResponseError):
         await extract_vision_flags(_sample_image_bytes())
 
 
-async def test_extract_vision_flags_propagates_timeout_error(respx_router):
-    respx_router.post(RESPONSES_URL).mock(side_effect=httpx.TimeoutException("timed out"))
+async def test_extract_vision_flags_propagates_timeout_error(monkeypatch):
+    _mock_create_response(
+        monkeypatch, side_effect=MetaModelAPITimeoutError("timed out")
+    )
 
     with pytest.raises(MetaModelAPITimeoutError):
         await extract_vision_flags(_sample_image_bytes())
