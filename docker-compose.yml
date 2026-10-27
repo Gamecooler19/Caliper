@@ -56,10 +56,15 @@ services:
       - caliper-net
 
   caddy:
-    image: caddy:2-alpine
+    build:
+      context: .
+      dockerfile: Dockerfile.caddy
     restart: unless-stopped
     depends_on:
       - api
+    environment:
+      CALIPER_DOMAIN: ${CALIPER_DOMAIN:-localhost}
+      CALIPER_API_KEY: ${CALIPER_API_KEY:-}
     ports:
       - "${HTTPS_PORT:-443}:443"
       - "${HTTP_PORT:-80}:80"

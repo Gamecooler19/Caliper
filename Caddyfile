@@ -6,13 +6,47 @@
 # internal CA (self-signed); set CALIPER_DOMAIN to a real hostname in
 # production to get Caddy's automatic ACME/Let's Encrypt certificate
 # instead.
+#
+# Module 5 addition: every request this proxy forwards to /api/v1/* gets
+# an X-API-Key header set to the CALIPER_API_KEY secret's value, injected
+# here -- not sent, stored, or known by the browser/frontend at all. The
+# frontend calls /api/v1/classify as a same-origin relative request with
+# zero API-key logic of its own; Caddy is the only place that ever attaches
+# the key to an outbound request.
 
 {$CALIPER_DOMAIN:localhost} {
 	tls internal
 
 	encode gzip
 
-	reverse_proxy api:8000
+	# Static frontend build, served by Caddy itself -- no separate
+	# frontend container or exposed port. Any request Caddy can't match
+	# to a static file under this root falls through to try_files'
+	# final fallback, index.html, so the SPA's own client-side state
+	# machine (not URL-based routing) always gets a 200 with the app
+	# shell regardless of the request path.
+	root * /srv/frontend
+	file_server
+
+	# API requests: inject the shared API key, then proxy to the
+	# backend. This block (and /health below) is matched before the
+	# catch-all file_server above, so backend traffic never falls
+	# through to try_files.
+	handle /api/v1/* {
+		reverse_proxy api:8000 {
+			header_up X-API-Key {$CALIPER_API_KEY}
+		}
+	}
+
+	# Liveness/readiness probe (backend/app/main.py's /health), proxied
+	# straight through with no API key -- unchanged from Module 4.
+	handle /health {
+		reverse_proxy api:8000
+	}
+
+	handle {
+		try_files {path} /index.html
+	}
 }
 
 # Plain HTTP is kept open only to redirect to HTTPS -- TLS is enforced

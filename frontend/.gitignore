@@ -1,0 +1,11 @@
+node_modules
+dist
+dist-ssr
+*.local
+*.tsbuildinfo
+test-results
+playwright-report
+blob-report
+playwright/.cache
+.env
+.env.local

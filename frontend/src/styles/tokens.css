@@ -1,0 +1,103 @@
+/*
+ * Color token system -- defined before any component code, per the
+ * Module 5 brief. Every semantic token below has both a light and a
+ * dark value; tailwind.config.ts only maps these into utility classes,
+ * it never hardcodes a color itself.
+ *
+ * Anchors (from the brief):
+ *   --color-text (light) / --color-bg (dark)  -> graphite #14181D
+ *   --color-accent                              -> teal    #14B8A6
+ *   --color-danger                              -> red     #DC2626
+ *   --color-success                             -> green   #16A34A
+ *   --color-amber                               -> amber   #D97706
+ *
+ * Values are R G B triplets (no `rgb()` wrapper) so Tailwind's
+ * `rgb(var(--x) / <alpha-value>)` pattern can apply opacity utilities.
+ */
+
+:root {
+  /* ---- light mode (default) ---------------------------------------- */
+  --color-bg: 250 250 249;              /* near-white page background */
+  --color-bg-subtle: 244 244 243;
+  --color-surface: 255 255 255;         /* card / panel background */
+  --color-surface-raised: 255 255 255;
+  --color-border: 228 228 226;
+  --color-border-strong: 203 203 200;
+  --color-text: 20 24 29;               /* #14181D graphite: light-mode heading/body text */
+  --color-text-muted: 100 105 112;
+  --color-text-on-accent: 255 255 255;
+
+  --color-accent: 20 184 166;           /* #14B8A6 teal */
+  --color-accent-hover: 15 148 134;
+  --color-accent-subtle: 219 247 242;
+
+  --color-danger: 220 38 38;            /* #DC2626 */
+  --color-danger-subtle: 254 232 232;
+  --color-danger-border: 248 180 180;
+
+  --color-success: 22 163 74;           /* #16A34A */
+  --color-success-subtle: 227 246 233;
+  --color-success-border: 167 227 186;
+
+  --color-amber: 217 119 6;             /* #D97706 */
+  --color-amber-subtle: 253 238 214;
+  --color-amber-border: 245 197 128;
+}
+
+.dark {
+  /* ---- dark mode ----------------------------------------------------- */
+  --color-bg: 20 24 29;                 /* #14181D graphite: dark-mode base */
+  --color-bg-subtle: 26 31 38;
+  --color-surface: 28 33 40;
+  --color-surface-raised: 34 40 48;
+  --color-border: 46 52 61;
+  --color-border-strong: 63 70 80;
+  --color-text: 230 233 236;
+  --color-text-muted: 156 163 173;
+  --color-text-on-accent: 14 18 22;
+
+  --color-accent: 45 212 191;           /* lightened teal for AA contrast on dark surfaces */
+  --color-accent-hover: 94 234 212;
+  --color-accent-subtle: 23 56 54;
+
+  --color-danger: 248 113 113;
+  --color-danger-subtle: 54 24 24;
+  --color-danger-border: 120 42 42;
+
+  --color-success: 74 222 128;
+  --color-success-subtle: 20 48 30;
+  --color-success-border: 42 94 59;
+
+  --color-amber: 251 191 36;
+  --color-amber-subtle: 56 42 12;
+  --color-amber-border: 120 86 24;
+}
+
+@media (prefers-color-scheme: dark) {
+  /* Respected only until the user explicitly toggles the in-app theme
+     switch, which sets the `.dark` class directly on <html> and is the
+     source of truth from then on (see src/lib/theme.ts). */
+  :root:not(.light):not(.dark) {
+    --color-bg: 20 24 29;
+    --color-bg-subtle: 26 31 38;
+    --color-surface: 28 33 40;
+    --color-surface-raised: 34 40 48;
+    --color-border: 46 52 61;
+    --color-border-strong: 63 70 80;
+    --color-text: 230 233 236;
+    --color-text-muted: 156 163 173;
+    --color-text-on-accent: 14 18 22;
+    --color-accent: 45 212 191;
+    --color-accent-hover: 94 234 212;
+    --color-accent-subtle: 23 56 54;
+    --color-danger: 248 113 113;
+    --color-danger-subtle: 54 24 24;
+    --color-danger-border: 120 42 42;
+    --color-success: 74 222 128;
+    --color-success-subtle: 20 48 30;
+    --color-success-border: 42 94 59;
+    --color-amber: 251 191 36;
+    --color-amber-subtle: 56 42 12;
+    --color-amber-border: 120 86 24;
+  }
+}
