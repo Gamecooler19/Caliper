@@ -61,6 +61,7 @@ from app.meta_api.client import (
     MetaModelAPITimeoutError,
 )
 from app.storage.media import MediaStorageError
+from app.vision.client import SamBox
 
 REAL_TEST_VALKEY_URL = "redis://localhost:16379/0"
 
@@ -144,6 +145,10 @@ def api_client(monkeypatch: pytest.MonkeyPatch, tmp_path, fake_valkey_client):
         yield client
 
 
+def _sample_display_boxes() -> list[SamBox]:
+    return [SamBox(x1=5, y1=6, x2=55, y2=46, w=64, h=48)]
+
+
 def _mock_pipeline_functions(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -153,6 +158,8 @@ def _mock_pipeline_functions(
     intake_side_effect=None,
     classification_result=None,
     report="A short report.",
+    display_boxes=None,
+    display_box_side_effect=None,
 ):
     monkeypatch.setattr(
         "app.api.routes.upload_media", AsyncMock(return_value="media/fake-key.png")
@@ -180,6 +187,15 @@ def _mock_pipeline_functions(
         ),
     )
     monkeypatch.setattr("app.api.routes.generate_report", AsyncMock(return_value=report))
+    monkeypatch.setattr(
+        "app.api.routes.segment_concept",
+        AsyncMock(
+            return_value=(
+                display_boxes if display_boxes is not None else _sample_display_boxes()
+            ),
+            side_effect=display_box_side_effect,
+        ),
+    )
 
 
 def _multipart_request(client: TestClient, *, headers=None, files=None, data=None):
@@ -215,11 +231,24 @@ def test_classify_success_path(api_client: TestClient, monkeypatch: pytest.Monke
 
     assert response.status_code == 200
     body = response.json()
-    assert set(body.keys()) == {"classification", "consistency_flags", "report"}
+    assert set(body.keys()) == {
+        "classification",
+        "consistency_flags",
+        "report",
+        "device_bounding_box",
+    }
     assert body["classification"]["risk_class"] == "A"
     assert body["classification"]["matched_rule_id"] == "FS-A-NONINVASIVE-NONACTIVE"
     assert body["consistency_flags"] == []
     assert body["report"] == "A short report."
+    assert body["device_bounding_box"] == {
+        "x1": 5,
+        "y1": 6,
+        "x2": 55,
+        "y2": 46,
+        "image_width": 64,
+        "image_height": 48,
+    }
 
 
 def test_classify_success_path_includes_consistency_flags_when_discrepant(
@@ -237,6 +266,69 @@ def test_classify_success_path_includes_consistency_flags_when_discrepant(
     flags = response.json()["consistency_flags"]
     assert len(flags) == 1
     assert flags[0]["field_name"] == "invasiveness_tier"
+
+
+# ---------------------------------------------------------------------------
+# device_bounding_box: Module 5's display-only, independent SAM call
+# ---------------------------------------------------------------------------
+
+
+def test_classify_device_bounding_box_null_when_sam_finds_no_match(
+    api_client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    """Zero matches from the display-only segment_concept() call is a
+    valid outcome, not an error: the response field is null, and the
+    rest of the response is unaffected.
+    """
+
+    _mock_pipeline_functions(monkeypatch, display_boxes=[])
+
+    response = _multipart_request(api_client)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["device_bounding_box"] is None
+    assert body["classification"]["risk_class"] == "A"
+
+
+def test_classify_device_bounding_box_picks_largest_match(
+    api_client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    """When SAM returns multiple matches for the display-only call, the
+    largest-by-area box is used -- the same tie-break
+    app.vision.pipeline uses internally for its own, separate call.
+    """
+
+    small_box = SamBox(x1=0, y1=0, x2=10, y2=10, w=64, h=48)
+    large_box = SamBox(x1=1, y1=1, x2=60, y2=45, w=64, h=48)
+    _mock_pipeline_functions(monkeypatch, display_boxes=[small_box, large_box])
+
+    response = _multipart_request(api_client)
+
+    assert response.status_code == 200
+    box = response.json()["device_bounding_box"]
+    assert box == {"x1": 1, "y1": 1, "x2": 60, "y2": 45, "image_width": 64, "image_height": 48}
+
+
+def test_classify_device_bounding_box_failure_does_not_affect_other_error_cases(
+    api_client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    """A failure in the display-only second SAM call surfaces through
+    the same error-mapping path as any other Meta Model API failure --
+    it is not silently swallowed into a null box, since a genuine
+    upstream failure is different from SAM's documented "zero matches"
+    outcome.
+    """
+
+    _mock_pipeline_functions(
+        monkeypatch,
+        display_box_side_effect=MetaModelAPITimeoutError("timed out"),
+    )
+
+    response = _multipart_request(api_client)
+
+    assert response.status_code == 504
+    assert response.json() == {"error": "upstream_model_api_timeout"}
 
 
 # ---------------------------------------------------------------------------
