@@ -1,0 +1,22 @@
+# Caddyfile -- TLS-terminating reverse proxy for the Caliper API.
+#
+# Per architecture.md's Security posture: "Encryption ... in transit (TLS,
+# enforced end to end via Caddy)." CALIPER_DOMAIN defaults to localhost so
+# `docker compose up` works out of the box in development using Caddy's
+# internal CA (self-signed); set CALIPER_DOMAIN to a real hostname in
+# production to get Caddy's automatic ACME/Let's Encrypt certificate
+# instead.
+
+{$CALIPER_DOMAIN:localhost} {
+	tls internal
+
+	encode gzip
+
+	reverse_proxy api:8000
+}
+
+# Plain HTTP is kept open only to redirect to HTTPS -- TLS is enforced
+# end to end, nothing is served over HTTP.
+http://{$CALIPER_DOMAIN:localhost} {
+	redir https://{host}{uri} permanent
+}
