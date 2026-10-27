@@ -20,6 +20,9 @@ htmlcov/
 .idea/
 .vscode/
 *.log
+*.db
+*.sqlite
+*.sqlite3
 secrets/
 postgres-data/
 valkey-data/
