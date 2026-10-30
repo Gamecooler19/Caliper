@@ -17,6 +17,7 @@ role away from ``admin`` is rejected with 400 ``last_admin_guard``
 unless at least one *other* active admin would remain. Checked against
 the database inside the same transaction as the change, before it is
 applied.
+
 This replaces the previous, narrower "an admin cannot deactivate or
 demote their own account" rule, which blocked self-targeting PATCHes
 unconditionally -- even when a second active admin existed to take
