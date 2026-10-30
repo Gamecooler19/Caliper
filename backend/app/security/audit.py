@@ -19,7 +19,7 @@ import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.classification.models import AuditLogEntry
-from app.db import AuditLogRecord
+from app.db import AdminAuditLogRecord, AuditLogRecord
 
 
 def build_audit_entry(
@@ -72,6 +72,51 @@ async def record_audit_entry(
         timestamp=dt.datetime.fromisoformat(entry.timestamp),
         classification_result_id=entry.classification_result_id,
         user_id=user_id,
+    )
+    session.add(record)
+    await session.flush()
+    return record
+
+
+#: Valid ``action`` values for :func:`record_admin_audit_entry` (Module 6
+#: fix #3). Kept as a plain tuple of strings, not an enum, since this is
+#: the audit record's own vocabulary, independent of any ORM enum.
+ADMIN_AUDIT_ACTIONS = (
+    "user_created",
+    "role_changed",
+    "user_deactivated",
+    "user_reactivated",
+    "totp_reset",
+)
+
+
+async def record_admin_audit_entry(
+    session: AsyncSession,
+    *,
+    actor_user_id: uuid.UUID,
+    action: str,
+    target_user_id: uuid.UUID | None = None,
+    details: dict | None = None,
+) -> AdminAuditLogRecord:
+    """Persist one append-only entry to ``admin_audit_log`` (Module 6 fix
+    #3), the generic account-administration audit trail distinct from
+    :class:`AuditLogRecord` (Module 1's classification-run audit log,
+    which this function never touches).
+
+    Called from every mutating ``/admin/users*`` endpoint, including the
+    reset-totp action (migrated here for consistency so all admin
+    actions share one audit trail). Only inserts; never updates or
+    deletes an existing row.
+    """
+
+    if action not in ADMIN_AUDIT_ACTIONS:
+        raise ValueError(f"Unknown admin audit action: {action!r}")
+
+    record = AdminAuditLogRecord(
+        actor_user_id=actor_user_id,
+        target_user_id=target_user_id,
+        action=action,
+        details=details or {},
     )
     session.add(record)
     await session.flush()

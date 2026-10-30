@@ -5,11 +5,14 @@ It reads its connection string through the secrets layer
 (``app.security.secrets.load_database_url``), never from a hardcoded
 value or a committed file.
 
-Only one table exists so far: the append-only audit log described in
-architecture.md's Security posture ("An append-only audit log recording
-who ran a classification, what was submitted, and what was returned").
-Business data (devices, classification history) is out of scope for
-Module 1 -- see architecture.md's Build sequence.
+Only one table existed in Module 1: the append-only audit log described
+in architecture.md's Security posture ("An append-only audit log
+recording who ran a classification, what was submitted, and what was
+returned"). Business data (devices, classification history) is out of
+scope for Module 1 -- see architecture.md's Build sequence. Module 6
+adds ``users`` (``app.auth.models``) and ``admin_audit_log`` (below);
+the original ``audit_log``/:class:`AuditLogRecord` table is untouched
+in shape, only gaining a nullable ``user_id`` FK.
 """
 
 from __future__ import annotations
@@ -18,8 +21,10 @@ import datetime as dt
 import uuid
 
 from sqlalchemy import DateTime, ForeignKey, String, Uuid
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.types import JSON
 
 from app.security.secrets import load_database_url
 
@@ -52,6 +57,42 @@ class AuditLogRecord(Base):
     #: CALIPER_API_KEY-authenticated calls (no per-key identity).
     user_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid, ForeignKey("users.id"), nullable=True
+    )
+
+
+class AdminAuditLogRecord(Base):
+    """Append-only audit trail for admin user-management actions (Module
+    6 fix #3).
+
+    Deliberately a separate table from :class:`AuditLogRecord`: that
+    table belongs to Module 1 (classification-run auditing) and is off
+    limits. This table is generic to *account administration* events --
+    user creation, role changes, (de)activation, TOTP reset -- which
+    have a different shape (an acting admin, an optional target user,
+    and structured before/after details) than a classification run.
+    Nothing in this codebase issues an UPDATE or DELETE against it.
+    """
+
+    __tablename__ = "admin_audit_log"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    actor_user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("users.id"), nullable=False
+    )
+    #: The user acted upon, if any. NULL is not expected in practice today
+    #: (every current action type has a target), but kept nullable per
+    #: spec for a future actor-only action (e.g. a login-as-self audit).
+    target_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("users.id"), nullable=True
+    )
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    #: Structured context for the action, e.g. {"old_role": "analyst",
+    #: "new_role": "admin"}. JSON on SQLite (tests), JSONB on Postgres.
+    details: Mapped[dict] = mapped_column(
+        JSON().with_variant(JSONB, "postgresql"), nullable=False, default=dict
+    )
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: dt.datetime.now(dt.UTC)
     )
 
 

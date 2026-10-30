@@ -10,7 +10,7 @@ from sqlalchemy import select
 from app.auth import totp
 from app.auth.models import User, UserRole
 from app.auth.sessions import SESSION_COOKIE_NAME
-from app.db import AuditLogRecord
+from app.db import AdminAuditLogRecord
 from tests.auth.conftest import DEFAULT_PASSWORD, login_fully
 
 ADMIN_EMAIL = "admin@example.com"
@@ -234,14 +234,15 @@ def test_reset_totp_forces_reenrollment_ends_sessions_and_is_audited(auth_env, t
     assert stored.totp_enabled is False
 
     async def _audit(session):
-        query = select(AuditLogRecord).where(AuditLogRecord.action.like("admin_reset_totp%"))
+        query = select(AdminAuditLogRecord).where(AdminAuditLogRecord.action == "totp_reset")
         return (await session.execute(query)).scalars().all()
 
     rows = auth_env.run_db(_audit)
     assert len(rows) == 1
-    assert rows[0].action == f"admin_reset_totp:{target_id}"
-    assert rows[0].actor == ADMIN_EMAIL
-    assert rows[0].user_id == admin.id
+    assert rows[0].action == "totp_reset"
+    assert rows[0].actor_user_id == admin.id
+    assert rows[0].target_user_id == target_id
+    assert rows[0].details == {}
 
 
 def test_admin_session_cookie_is_the_only_thing_that_authorizes(auth_env, totp_codes):
@@ -256,3 +257,186 @@ def test_admin_session_cookie_is_the_only_thing_that_authorizes(auth_env, totp_c
         return len((await session.execute(select(User))).scalars().all())
 
     assert auth_env.run_db(_count) == 1
+
+
+# ---------------------------------------------------------------------------
+# Module 6 fix #3: admin_audit_log, one entry per action type
+# ---------------------------------------------------------------------------
+
+
+def _admin_audit_rows(auth_env, action: str | None = None):
+    async def _go(session):
+        query = select(AdminAuditLogRecord)
+        if action is not None:
+            query = query.where(AdminAuditLogRecord.action == action)
+        return (await session.execute(query)).scalars().all()
+
+    return auth_env.run_db(_go)
+
+
+def test_user_created_writes_exactly_one_correctly_shaped_audit_entry(auth_env, totp_codes):
+    _login(auth_env, totp_codes, ADMIN_EMAIL, UserRole.ADMIN)
+    admin = auth_env.get_user(ADMIN_EMAIL)
+
+    created = auth_env.client.post(
+        "/api/v1/admin/users", json={"email": "newbie@example.com", "role": "analyst"}
+    )
+    assert created.status_code == 201
+    target_id = uuid.UUID(created.json()["id"])
+
+    rows = _admin_audit_rows(auth_env, "user_created")
+    assert len(rows) == 1
+    assert rows[0].actor_user_id == admin.id
+    assert rows[0].target_user_id == target_id
+    assert rows[0].details == {"email": "newbie@example.com", "role": "analyst"}
+
+
+def test_role_changed_writes_exactly_one_correctly_shaped_audit_entry(auth_env, totp_codes):
+    _login(auth_env, totp_codes, ADMIN_EMAIL, UserRole.ADMIN)
+    admin = auth_env.get_user(ADMIN_EMAIL)
+    target_id = auth_env.seed_user(TARGET_EMAIL, role=UserRole.ANALYST)
+
+    response = auth_env.client.patch(f"/api/v1/admin/users/{target_id}", json={"role": "auditor"})
+    assert response.status_code == 200
+
+    rows = _admin_audit_rows(auth_env, "role_changed")
+    assert len(rows) == 1
+    assert rows[0].actor_user_id == admin.id
+    assert rows[0].target_user_id == target_id
+    assert rows[0].details == {"old_role": "analyst", "new_role": "auditor"}
+
+
+def test_user_deactivated_writes_exactly_one_correctly_shaped_audit_entry(auth_env, totp_codes):
+    _login(auth_env, totp_codes, ADMIN_EMAIL, UserRole.ADMIN)
+    admin = auth_env.get_user(ADMIN_EMAIL)
+    target_id = auth_env.seed_user(TARGET_EMAIL)
+
+    response = auth_env.client.patch(
+        f"/api/v1/admin/users/{target_id}", json={"is_active": False}
+    )
+    assert response.status_code == 200
+
+    rows = _admin_audit_rows(auth_env, "user_deactivated")
+    assert len(rows) == 1
+    assert rows[0].actor_user_id == admin.id
+    assert rows[0].target_user_id == target_id
+    assert rows[0].details == {"is_active": False}
+
+
+def test_user_reactivated_writes_exactly_one_correctly_shaped_audit_entry(auth_env, totp_codes):
+    _login(auth_env, totp_codes, ADMIN_EMAIL, UserRole.ADMIN)
+    admin = auth_env.get_user(ADMIN_EMAIL)
+    target_id = auth_env.seed_user(TARGET_EMAIL, is_active=False)
+
+    response = auth_env.client.patch(f"/api/v1/admin/users/{target_id}", json={"is_active": True})
+    assert response.status_code == 200
+
+    rows = _admin_audit_rows(auth_env, "user_reactivated")
+    assert len(rows) == 1
+    assert rows[0].actor_user_id == admin.id
+    assert rows[0].target_user_id == target_id
+    assert rows[0].details == {"is_active": True}
+
+
+def test_totp_reset_writes_exactly_one_correctly_shaped_audit_entry(auth_env, totp_codes):
+    _login(auth_env, totp_codes, ADMIN_EMAIL, UserRole.ADMIN)
+    admin = auth_env.get_user(ADMIN_EMAIL)
+    target_id = auth_env.seed_user(TARGET_EMAIL, totp_secret=totp.generate_secret())
+
+    response = auth_env.client.post(f"/api/v1/admin/users/{target_id}/reset-totp")
+    assert response.status_code == 200
+
+    rows = _admin_audit_rows(auth_env, "totp_reset")
+    assert len(rows) == 1
+    assert rows[0].actor_user_id == admin.id
+    assert rows[0].target_user_id == target_id
+    assert rows[0].details == {}
+
+
+def test_patch_with_no_actual_change_writes_no_audit_entry(auth_env, totp_codes):
+    """Setting a role/is_active to its current value is not a change and
+    should not create a misleading audit row."""
+
+    _login(auth_env, totp_codes, ADMIN_EMAIL, UserRole.ADMIN)
+    target_id = auth_env.seed_user(TARGET_EMAIL, role=UserRole.ANALYST, is_active=True)
+
+    response = auth_env.client.patch(
+        f"/api/v1/admin/users/{target_id}", json={"role": "analyst", "is_active": True}
+    )
+    assert response.status_code == 200
+    assert _admin_audit_rows(auth_env) == []
+
+
+# ---------------------------------------------------------------------------
+# Module 6 fix #4: last-admin guard
+# ---------------------------------------------------------------------------
+
+
+def test_deactivating_the_last_active_admin_is_rejected(auth_env, totp_codes):
+    """A lone active admin acting on themselves (the degenerate case of
+    the guard: zero *other* active admins) is rejected with
+    last_admin_guard."""
+
+    _login(auth_env, totp_codes, ADMIN_EMAIL, UserRole.ADMIN)
+    me_id = auth_env.get_user(ADMIN_EMAIL).id
+
+    response = auth_env.client.patch(f"/api/v1/admin/users/{me_id}", json={"is_active": False})
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "last_admin_guard"}
+    assert auth_env.get_user(ADMIN_EMAIL).is_active is True
+    assert _admin_audit_rows(auth_env) == []
+
+
+def test_demoting_the_last_active_admin_away_from_admin_is_rejected(auth_env, totp_codes):
+    _login(auth_env, totp_codes, ADMIN_EMAIL, UserRole.ADMIN)
+    me_id = auth_env.get_user(ADMIN_EMAIL).id
+
+    response = auth_env.client.patch(f"/api/v1/admin/users/{me_id}", json={"role": "analyst"})
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "last_admin_guard"}
+    assert auth_env.get_user(ADMIN_EMAIL).role == UserRole.ADMIN
+    assert _admin_audit_rows(auth_env) == []
+
+
+def test_the_guard_is_scoped_to_the_target_not_a_global_admin_count(auth_env, totp_codes):
+    """With exactly two active admins, deactivating the *other* one
+    still leaves the acting admin active -- the guard counts active
+    admins other than the target, not a global "more than one admin
+    exists" rule, so this succeeds."""
+
+    _login(auth_env, totp_codes, ADMIN_EMAIL, UserRole.ADMIN)
+    second_admin_id = auth_env.seed_user("second-admin@example.com", role=UserRole.ADMIN)
+
+    response = auth_env.client.patch(
+        f"/api/v1/admin/users/{second_admin_id}", json={"is_active": False}
+    )
+    assert response.status_code == 200
+    assert auth_env.get_user("second-admin@example.com").is_active is False
+
+
+def test_action_succeeds_when_a_second_active_admin_exists(auth_env, totp_codes):
+    """With two active admins, each can deactivate or demote the
+    *other* (though neither can touch themselves while they'd be the
+    only one left -- that's covered by the self-targeting tests above)."""
+
+    _login(auth_env, totp_codes, ADMIN_EMAIL, UserRole.ADMIN)
+    other_admin_id = auth_env.seed_user("other-admin@example.com", role=UserRole.ADMIN)
+
+    deactivate = auth_env.client.patch(
+        f"/api/v1/admin/users/{other_admin_id}", json={"is_active": False}
+    )
+    assert deactivate.status_code == 200
+    assert auth_env.get_user("other-admin@example.com").is_active is False
+
+    # And demotion of the acting admin's own account now succeeds too,
+    # once a *third* admin exists so that, with the second one already
+    # deactivated above, there is still one other active admin.
+    auth_env.seed_user("third-admin@example.com", role=UserRole.ADMIN)
+    demote = auth_env.client.patch(
+        f"/api/v1/admin/users/{auth_env.get_user(ADMIN_EMAIL).id}", json={"role": "analyst"}
+    )
+    assert demote.status_code == 200
+    assert auth_env.get_user(ADMIN_EMAIL).role == UserRole.ANALYST
+    assert auth_env.get_user("third-admin@example.com").role == UserRole.ADMIN
