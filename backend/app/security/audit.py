@@ -14,6 +14,7 @@ Nothing here makes an external network call.
 from __future__ import annotations
 
 import datetime as dt
+import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -50,12 +51,19 @@ def build_audit_entry(
 
 
 async def record_audit_entry(
-    session: AsyncSession, entry: AuditLogEntry
+    session: AsyncSession,
+    entry: AuditLogEntry,
+    user_id: uuid.UUID | None = None,
 ) -> AuditLogRecord:
     """Persist an :class:`AuditLogEntry` to the append-only audit_log table.
 
     Called on every classification run. Only inserts; never updates or
     deletes an existing row.
+
+    ``user_id`` (Module 6) is the acting account for session-authenticated
+    requests and stays ``None`` for API-key calls. It is a parameter here,
+    not a field on ``AuditLogEntry``, because that model lives in
+    ``app.classification`` (Module 1), which this module does not touch.
     """
 
     record = AuditLogRecord(
@@ -63,6 +71,7 @@ async def record_audit_entry(
         action=entry.action,
         timestamp=dt.datetime.fromisoformat(entry.timestamp),
         classification_result_id=entry.classification_result_id,
+        user_id=user_id,
     )
     session.add(record)
     await session.flush()

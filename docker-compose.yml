@@ -15,6 +15,7 @@ services:
       STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY:-}
       STORAGE_BUCKET: ${STORAGE_BUCKET:-}
       CALIPER_API_KEY: ${CALIPER_API_KEY:-}
+      COLUMN_ENCRYPTION_KEY: ${COLUMN_ENCRYPTION_KEY:-}
     depends_on:
       postgres:
         condition: service_healthy

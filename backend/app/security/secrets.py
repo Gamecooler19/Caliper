@@ -120,6 +120,16 @@ CALIPER_API_KEY = SecretSpec(
     "and RBAC are explicitly out of scope for Module 4.",
 )
 
+COLUMN_ENCRYPTION_KEY = SecretSpec(
+    env_var="COLUMN_ENCRYPTION_KEY",
+    required=True,
+    description="Fernet key (urlsafe-base64, 32 bytes) used by "
+    "app.security.crypto to encrypt sensitive database columns at rest "
+    "(currently users.totp_secret_encrypted). Generate with "
+    "`python -c 'from cryptography.fernet import Fernet; "
+    "print(Fernet.generate_key().decode())'`.",
+)
+
 
 def load_secret(spec: SecretSpec) -> str | None:
     """Read one secret from the environment according to its
@@ -229,5 +239,13 @@ def load_caliper_api_key() -> str:
     """Load the shared Caliper API key. Raises if unset."""
 
     value = load_secret(CALIPER_API_KEY)
+    assert value is not None  # required=True guarantees this or a raise above
+    return value
+
+
+def load_column_encryption_key() -> str:
+    """Load the Fernet key for column-level encryption. Raises if unset."""
+
+    value = load_secret(COLUMN_ENCRYPTION_KEY)
     assert value is not None  # required=True guarantees this or a raise above
     return value

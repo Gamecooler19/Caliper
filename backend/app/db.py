@@ -17,7 +17,7 @@ from __future__ import annotations
 import datetime as dt
 import uuid
 
-from sqlalchemy import DateTime, String
+from sqlalchemy import DateTime, ForeignKey, String, Uuid
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -48,6 +48,11 @@ class AuditLogRecord(Base):
     classification_result_id: Mapped[str | None] = mapped_column(
         String(36), nullable=True
     )
+    #: Module 6: the account that performed the action. NULL for
+    #: CALIPER_API_KEY-authenticated calls (no per-key identity).
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("users.id"), nullable=True
+    )
 
 
 def build_engine(database_url: str | None = None):
@@ -66,3 +71,10 @@ def build_session_factory(engine) -> async_sessionmaker[AsyncSession]:
     """Build an async session factory bound to ``engine``."""
 
     return async_sessionmaker(engine, expire_on_commit=False)
+
+
+# Register the Module 6 ``users`` table on ``Base.metadata`` wherever
+# ``Base`` is used (Alembic, ``Base.metadata.create_all`` in tests), since
+# ``audit_log.user_id`` is a foreign key to it. Imported last because
+# ``app.auth.models`` imports ``Base`` from this module.
+import app.auth.models  # noqa: E402,F401
