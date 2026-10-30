@@ -57,6 +57,7 @@ from app.auth.sessions import (
     create_login_token,
     create_session,
     delete_login_token,
+    destroy_other_sessions_for_user,
     destroy_session,
     read_login_token,
 )
@@ -327,5 +328,12 @@ async def change_password(
         stored.password_hash = hash_password(body.new_password)
         stored.must_change_password = False
         await db.commit()
+
+    # A credential change must not leave sessions opened with the old
+    # password alive. Outstanding login tokens are left to expire: a
+    # challenge token still needs a valid TOTP code and lives 5 minutes.
+    await destroy_other_sessions_for_user(
+        request.app.state.valkey_client, user.id, keep_session_id=user.session_id
+    )
 
     return StatusResponse()

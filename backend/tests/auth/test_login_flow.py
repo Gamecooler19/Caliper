@@ -385,6 +385,26 @@ def test_change_password_rejects_wrong_current_short_and_unchanged(auth_env, tot
     assert auth_env.get_user(EMAIL).must_change_password is True
 
 
+def test_changing_password_ends_the_users_other_sessions_but_not_the_current_one(
+    auth_env, totp_codes, secret
+):
+    auth_env.seed_user(EMAIL, totp_secret=secret, must_change_password=True)
+    # A second device, logged in earlier (e.g. with a password someone else knows).
+    other_device = auth_env.login_as_other_user(EMAIL, secret)
+    assert other_device.get("/api/v1/auth/me").status_code == 200
+    totp_codes.next(secret)  # step 0 was consumed by the other device
+    assert login_fully(auth_env, totp_codes, EMAIL, secret).status_code == 200
+
+    changed = auth_env.client.post(
+        "/api/v1/auth/change-password",
+        json={"current_password": DEFAULT_PASSWORD, "new_password": "a brand new passphrase"},
+    )
+
+    assert changed.status_code == 200
+    assert other_device.get("/api/v1/auth/me").status_code == 401
+    assert auth_env.client.get("/api/v1/auth/me").status_code == 200
+
+
 def test_new_password_is_what_works_for_the_next_login(auth_env, totp_codes, secret):
     _login_must_change(auth_env, totp_codes, secret)
     new_password = "a brand new passphrase"

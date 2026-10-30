@@ -115,6 +115,18 @@ async def destroy_all_sessions_for_user(client: redis_asyncio.Redis, user_id: uu
     await client.delete(_user_sessions_key(user_id))
 
 
+async def destroy_other_sessions_for_user(
+    client: redis_asyncio.Redis, user_id: uuid.UUID, keep_session_id: str
+) -> None:
+    """End every session of ``user_id`` except ``keep_session_id``."""
+
+    members = await client.smembers(_user_sessions_key(user_id))  # type: ignore[misc]
+    for session_id in members:
+        if session_id != keep_session_id:
+            await client.delete(_session_key(session_id))
+            await client.srem(_user_sessions_key(user_id), session_id)  # type: ignore[misc]
+
+
 async def create_login_token(
     client: redis_asyncio.Redis, kind: str, user_id: uuid.UUID, ttl_seconds: int
 ) -> str:
