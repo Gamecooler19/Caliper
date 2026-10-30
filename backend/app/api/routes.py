@@ -59,13 +59,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile, status
 
-from app.api.auth import require_api_key
 from app.api.errors import InvalidRequestError, RateLimitExceededError
 from app.api.rate_limit import check_rate_limit
 from app.api.schemas import ClassifyResponse, DeviceBoundingBox
+from app.auth.dependencies import require_api_key_or_session
 from app.classification.engine import classify
 from app.crosscheck.consistency import check_consistency
 from app.intake.parser import parse_intended_use
@@ -180,7 +181,7 @@ async def classify_device(
     request: Request,
     image: UploadFile | None = File(default=None),  # noqa: B008
     description: str | None = Form(default=None),  # noqa: B008
-    actor: str = Depends(require_api_key),  # noqa: B008
+    actor: str = Depends(require_api_key_or_session),  # noqa: B008
 ) -> ClassifyResponse:
     """Classify a device from a photo and a free-text description.
 
@@ -192,7 +193,15 @@ async def classify_device(
     )
 
     valkey_client = request.app.state.valkey_client
-    rate_limit_result = await check_rate_limit(valkey_client, actor)
+    user_id: uuid.UUID | None = request.state.user_id
+    if user_id is None:
+        # CALIPER_API_KEY caller: the Module 4 limiter call, unchanged.
+        rate_limit_result = await check_rate_limit(valkey_client, actor)
+    else:
+        # Session caller: same mechanism, separately keyed per user.
+        rate_limit_result = await check_rate_limit(
+            valkey_client, str(user_id), route="classify-session"
+        )
     if not rate_limit_result.allowed:
         raise RateLimitExceededError(rate_limit_result.retry_after_seconds)
 
@@ -226,7 +235,7 @@ async def classify_device(
             action="classify",
             classification_result_id=None,
         )
-        await record_audit_entry(session, entry)
+        await record_audit_entry(session, entry, user_id=user_id)
         await session.commit()
 
     return ClassifyResponse(

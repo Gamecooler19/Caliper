@@ -22,8 +22,11 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from pydantic import BaseModel
 
+from app.admin.routes import router as admin_router
 from app.api.errors import register_exception_handlers
 from app.api.routes import router as api_v1_router
+from app.auth.errors import register_auth_exception_handlers
+from app.auth.routes import router as auth_router
 from app.db import build_engine, build_session_factory
 from app.valkey_client import build_valkey_client
 
@@ -54,7 +57,10 @@ app = FastAPI(
 )
 
 register_exception_handlers(app)
+register_auth_exception_handlers(app)
 app.include_router(api_v1_router)
+app.include_router(auth_router)
+app.include_router(admin_router)
 
 
 class HealthResponse(BaseModel):
