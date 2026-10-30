@@ -34,6 +34,20 @@ class ForbiddenError(AuthError):
     """Authenticated, but the role does not permit this route."""
 
 
+class ReadOnlyRoleError(AuthError):
+    """A session-authenticated role without classify permission (currently
+    just ``auditor``) called ``POST /api/v1/classify``. Distinct from
+    :class:`ForbiddenError` so the response carries a specific, stable
+    error code. The ``CALIPER_API_KEY`` path has no role concept and
+    never raises this."""
+
+
+class LastAdminGuardError(AuthError):
+    """Refused: this admin PATCH would leave zero other active admins
+    (deactivating the last one, or demoting the last one away from
+    ``admin``)."""
+
+
 class PasswordChangeRequiredError(AuthError):
     """The account must change its password before using this route."""
 
@@ -65,6 +79,12 @@ def register_auth_exception_handlers(app: FastAPI) -> None:
     async def _forbidden(request: Request, exc: ForbiddenError):
         return JSONResponse(status_code=403, content={"error": "forbidden"})
 
+    async def _read_only_role(request: Request, exc: ReadOnlyRoleError):
+        return JSONResponse(status_code=403, content={"error": "read_only_role"})
+
+    async def _last_admin_guard(request: Request, exc: LastAdminGuardError):
+        return JSONResponse(status_code=400, content={"error": "last_admin_guard"})
+
     async def _password_change(request: Request, exc: PasswordChangeRequiredError):
         return JSONResponse(status_code=403, content={"error": "password_change_required"})
 
@@ -85,6 +105,8 @@ def register_auth_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(InvalidTotpCodeError, _invalid_totp)  # type: ignore[arg-type]
     app.add_exception_handler(SessionRequiredError, _session_required)  # type: ignore[arg-type]
     app.add_exception_handler(ForbiddenError, _forbidden)  # type: ignore[arg-type]
+    app.add_exception_handler(ReadOnlyRoleError, _read_only_role)  # type: ignore[arg-type]
+    app.add_exception_handler(LastAdminGuardError, _last_admin_guard)  # type: ignore[arg-type]
     app.add_exception_handler(PasswordChangeRequiredError, _password_change)  # type: ignore[arg-type]
     app.add_exception_handler(NotFoundError, _not_found)  # type: ignore[arg-type]
     app.add_exception_handler(EmailInUseError, _email_in_use)  # type: ignore[arg-type]

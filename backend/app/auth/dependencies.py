@@ -12,6 +12,13 @@ request: without session-first resolution a logged-in browser would
 always be attributed to the API key. An invalid or expired cookie falls
 through to the API-key check rather than failing outright, so the
 existing key-injecting deployment keeps working.
+
+Module 6 fix #2: a valid session whose role is not in
+``CLASSIFY_ALLOWED_ROLES`` (currently ``admin``/``analyst``) gets 403
+``read_only_role`` rather than being allowed to classify -- an
+``auditor`` session is read-only. This check only applies to the
+session branch; the ``CALIPER_API_KEY`` path has no role concept and is
+unaffected.
 """
 
 from __future__ import annotations
@@ -23,13 +30,24 @@ from dataclasses import dataclass
 from fastapi import Depends, Header, Request
 
 from app.api.auth import require_api_key
-from app.auth.errors import ForbiddenError, PasswordChangeRequiredError, SessionRequiredError
+from app.auth.errors import (
+    ForbiddenError,
+    PasswordChangeRequiredError,
+    ReadOnlyRoleError,
+    SessionRequiredError,
+)
 from app.auth.models import User, UserRole
 from app.auth.sessions import (
     SESSION_COOKIE_NAME,
     destroy_session,
     refresh_session,
 )
+
+#: Roles permitted to call POST /api/v1/classify over a session (Module 6
+#: fix #2): a read-only ``auditor`` session must not be able to run a
+#: classification. The CALIPER_API_KEY path has no role concept and is
+#: unaffected by this restriction.
+CLASSIFY_ALLOWED_ROLES = frozenset({UserRole.ADMIN, UserRole.ANALYST})
 
 
 @dataclass(frozen=True)
@@ -129,6 +147,8 @@ async def require_api_key_or_session(
         if user is not None:
             if user.must_change_password:
                 raise PasswordChangeRequiredError()
+            if user.role not in CLASSIFY_ALLOWED_ROLES:
+                raise ReadOnlyRoleError()
             request.state.user_id = user.id
             return user.email
 

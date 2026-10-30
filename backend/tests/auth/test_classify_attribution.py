@@ -75,6 +75,52 @@ def logged_in_user(auth_env, totp_codes):
     return user_id
 
 
+def _login_as(auth_env, totp_codes, email: str, role: UserRole):
+    secret = totp.generate_secret()
+    user_id = auth_env.seed_user(email, role=role, totp_secret=secret)
+    assert login_fully(auth_env, totp_codes, email, secret).status_code == 200
+    return user_id
+
+
+# ---------------------------------------------------------------------------
+# Role restriction on the session path (Module 6 fix #2)
+# ---------------------------------------------------------------------------
+
+
+def test_auditor_session_gets_403_read_only_role_on_classify(
+    auth_env, totp_codes, mocked_pipeline
+):
+    _login_as(auth_env, totp_codes, "auditor@example.com", UserRole.AUDITOR)
+
+    response = _classify(auth_env.client)
+
+    assert response.status_code == 403
+    assert response.json() == {"error": "read_only_role"}
+    # Nothing was run or audited as a side effect of the rejected call.
+    assert _audit_rows(auth_env) == []
+
+
+@pytest.mark.parametrize("role", [UserRole.ADMIN, UserRole.ANALYST])
+def test_admin_and_analyst_sessions_still_classify_exactly_as_before(
+    auth_env, totp_codes, mocked_pipeline, role
+):
+    """Regression for Module 6 fix #2: the roles that were always
+    allowed to classify over a session are entirely unaffected by the
+    new auditor restriction."""
+
+    email = f"{role.value}@example.com"
+    user_id = _login_as(auth_env, totp_codes, email, role)
+
+    response = _classify(auth_env.client)
+
+    assert response.status_code == 200
+    rows = _audit_rows(auth_env)
+    assert len(rows) == 1
+    assert rows[0].user_id == user_id
+    assert rows[0].actor == email
+    assert rows[0].action == "classify"
+
+
 # ---------------------------------------------------------------------------
 # Session-authenticated classify
 # ---------------------------------------------------------------------------
