@@ -235,6 +235,7 @@ def test_classify_success_path(api_client: TestClient, monkeypatch: pytest.Monke
         "classification",
         "consistency_flags",
         "report",
+        "disclaimer",
         "device_bounding_box",
     }
     assert body["classification"]["risk_class"] == "A"
@@ -310,25 +311,103 @@ def test_classify_device_bounding_box_picks_largest_match(
     assert box == {"x1": 1, "y1": 1, "x2": 60, "y2": 45, "image_width": 64, "image_height": 48}
 
 
-def test_classify_device_bounding_box_failure_does_not_affect_other_error_cases(
+@pytest.mark.parametrize(
+    "display_error",
+    [
+        MetaModelAPITimeoutError("timed out"),
+        MetaModelAPIError(status_code=500, message="Internal server error."),
+        MetaModelAPIResponseError("Malformed response body"),
+        RuntimeError("anything else at all"),
+    ],
+    ids=["timeout", "api_error", "response_error", "unexpected"],
+)
+def test_classify_display_box_failure_resolves_to_null_box_and_leaves_response_unchanged(
+    api_client: TestClient, monkeypatch: pytest.MonkeyPatch, display_error: Exception
+):
+    """Any exception from the display-only second segment_concept() call
+    is caught at that call site: the request still succeeds (200),
+    device_bounding_box is null, and classification / consistency_flags /
+    report / disclaimer are identical to a request where the call
+    succeeded. It must never reach the registered exception handlers.
+    """
+
+    _mock_pipeline_functions(monkeypatch)
+    baseline = _multipart_request(api_client)
+    assert baseline.status_code == 200
+
+    _mock_pipeline_functions(monkeypatch, display_box_side_effect=display_error)
+    response = _multipart_request(api_client)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["device_bounding_box"] is None
+    baseline_body = baseline.json()
+    for field in ("classification", "consistency_flags", "report", "disclaimer"):
+        assert body[field] == baseline_body[field]
+
+
+def test_classify_display_box_failure_is_logged_with_context(
+    api_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    _mock_pipeline_functions(
+        monkeypatch, display_box_side_effect=MetaModelAPITimeoutError("timed out")
+    )
+
+    with caplog.at_level("ERROR", logger="app.api.routes"):
+        response = _multipart_request(api_client)
+
+    assert response.status_code == 200
+    records = [r for r in caplog.records if r.name == "app.api.routes"]
+    assert len(records) == 1
+    assert records[0].exc_info is not None
+    assert "display" in records[0].getMessage().lower()
+    assert "image/png" in records[0].getMessage()
+
+
+def test_classify_display_box_failure_does_not_mask_intake_failure(
     api_client: TestClient, monkeypatch: pytest.MonkeyPatch
 ):
-    """A failure in the display-only second SAM call surfaces through
-    the same error-mapping path as any other Meta Model API failure --
-    it is not silently swallowed into a null box, since a genuine
-    upstream failure is different from SAM's documented "zero matches"
-    outcome.
+    """The display call's swallow is independent of the correctness-
+    critical gather: with both failing, the request still fails hard
+    on parse_intended_use's error, exactly as it does today.
     """
 
     _mock_pipeline_functions(
         monkeypatch,
-        display_box_side_effect=MetaModelAPITimeoutError("timed out"),
+        intake_side_effect=IntakeParsingError("Could not resolve 'invasiveness_tier'."),
+        display_box_side_effect=RuntimeError("display call also failed"),
     )
 
     response = _multipart_request(api_client)
 
-    assert response.status_code == 504
-    assert response.json() == {"error": "upstream_model_api_timeout"}
+    assert response.status_code == 422
+    assert response.json()["error"] == "intake_parsing_failed"
+
+
+def test_classify_disclaimer_field_equals_classification_result_disclaimer(
+    api_client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    """``disclaimer`` is populated straight from result.disclaimer, not
+    parsed out of the report: the mocked report here deliberately does
+    not contain the disclaimer at all, so only a direct copy can pass.
+    """
+
+    result = _sample_classification_result().model_copy(
+        update={"disclaimer": "Custom disclaimer text, distinct from the report."}
+    )
+    _mock_pipeline_functions(
+        monkeypatch, classification_result=result, report="Report with no disclaimer."
+    )
+
+    response = _multipart_request(api_client)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["disclaimer"] == result.disclaimer
+    assert body["report"] == "Report with no disclaimer."
+    assert body["classification"]["disclaimer"] == result.disclaimer
 
 
 # ---------------------------------------------------------------------------

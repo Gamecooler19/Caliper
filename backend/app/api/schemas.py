@@ -41,14 +41,22 @@ class ClassifyResponse(BaseModel):
 
     The three top-level keys the Module 4 brief specifies --
     ``classification``, ``consistency_flags``, and ``report`` -- plus
-    one Module 5 addition: ``device_bounding_box``, nullable, present
-    only for display purposes (see :class:`DeviceBoundingBox`). ``None``
-    when the second, independent SAM call finds no match -- the same
-    "zero matches is a valid outcome" semantics ``segment_concept()``
-    already documents, not an error.
+    two Module 5 additions:
+
+    - ``disclaimer``: copied directly from ``ClassificationResult.disclaimer``
+      (never parsed out of ``report``), so clients can render it on its
+      own. ``report`` still ends with the same disclaimer, unchanged,
+      for callers that only read ``report``.
+    - ``device_bounding_box``: nullable, present only for display
+      purposes (see :class:`DeviceBoundingBox`). ``None`` when the
+      second, independent SAM call finds no match -- the same "zero
+      matches is a valid outcome" semantics ``segment_concept()``
+      already documents -- or when that display-only call fails for any
+      reason (see ``backend/app/api/routes.py``).
     """
 
     classification: ClassificationResult
     consistency_flags: list[ConsistencyFlag]
     report: str
+    disclaimer: str
     device_bounding_box: DeviceBoundingBox | None = None

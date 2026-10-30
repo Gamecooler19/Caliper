@@ -6,8 +6,10 @@ Orchestrates Modules 1-3 for one request:
 2. ``upload_media()`` to store the image.
 3. ``extract_vision_flags()``, ``parse_intended_use()``, and (Module 5
    addition) a second, independent ``segment_concept()`` call made
-   purely for display purposes, all concurrently via ``asyncio.gather``
-   -- none of the three depends on either other's output.
+   purely for display purposes. The first two run together in
+   ``asyncio.gather`` and fail hard; the display call runs concurrently
+   as its own task and never raises (failures are logged and resolve to
+   a ``None`` box).
 4. ``check_consistency()`` on the vision/profile pair.
 5. ``classify()`` using the parsed profile.
 6. ``generate_report()`` using the classification result.
@@ -44,13 +46,19 @@ draw over the user's own photo. This call:
   loader -- no new secret, no new model ID.
 - Resolves to ``None`` on the response when SAM returns zero matches,
   per ``segment_concept()``'s own documented "zero matches is a valid,
-  non-error outcome" semantics -- never raises just because the
-  concept wasn't found in the frame.
+  non-error outcome" semantics.
+- Resolves to ``None`` (after ``logger.exception``) on *any* exception,
+  including timeouts and API errors: it is display-only, so its failure
+  must not fail the request or alter classification, consistency flags,
+  report, or disclaimer. This is deliberately unlike
+  ``extract_vision_flags()`` / ``parse_intended_use()``, whose failures
+  remain hard failures.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile, status
 
@@ -67,6 +75,8 @@ from app.security.secrets import load_sam_model_id
 from app.storage.media import upload_media
 from app.vision.client import SamBox, segment_concept
 from app.vision.pipeline import extract_vision_flags
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1")
 
@@ -106,18 +116,32 @@ async def _locate_device_for_display(
 ) -> DeviceBoundingBox | None:
     """Run the second, independent, display-only SAM 3.1 call and
     return a :class:`DeviceBoundingBox`, or ``None`` if SAM found no
-    match for the concept prompt -- the documented, valid "zero
-    matches" outcome, not an error.
+    match for the concept prompt (the documented, valid "zero
+    matches" outcome) or if anything in this lookup raised (logged,
+    never propagated).
     """
 
-    sam_model = load_sam_model_id()
-    boxes = await segment_concept(
-        image_bytes,
-        _DISPLAY_BOX_CONCEPT_PROMPT,
-        model=sam_model,
-        content_type=content_type,
-    )
-    return _largest_box_for_display(boxes) if boxes else None
+    try:
+        sam_model = load_sam_model_id()
+        boxes = await segment_concept(
+            image_bytes,
+            _DISPLAY_BOX_CONCEPT_PROMPT,
+            model=sam_model,
+            content_type=content_type,
+        )
+        return _largest_box_for_display(boxes) if boxes else None
+    except Exception:
+        # Display-only: a failure here must never fail the request or
+        # touch the classification, so it resolves to "no box" instead
+        # of reaching the registered exception handlers.
+        logger.exception(
+            "Display-only device bounding box lookup failed; resolving to None "
+            "(concept=%r, content_type=%s, image_bytes=%d)",
+            _DISPLAY_BOX_CONCEPT_PROMPT,
+            content_type,
+            len(image_bytes),
+        )
+        return None
 
 
 async def _read_and_validate_request(
@@ -174,11 +198,20 @@ async def classify_device(
 
     await upload_media(image_bytes, content_type)
 
-    vision_flags, profile, device_bounding_box = await asyncio.gather(
-        extract_vision_flags(image_bytes),
-        parse_intended_use(description_text),
-        _locate_device_for_display(image_bytes, content_type),
-    )
+    # The display-only lookup runs concurrently but separately from the
+    # correctness-critical gather below, and never raises (see
+    # _locate_device_for_display). If the gather fails hard, the
+    # display task is cancelled and the original error propagates.
+    display_task = asyncio.create_task(_locate_device_for_display(image_bytes, content_type))
+    try:
+        vision_flags, profile = await asyncio.gather(
+            extract_vision_flags(image_bytes),
+            parse_intended_use(description_text),
+        )
+    except BaseException:
+        display_task.cancel()
+        raise
+    device_bounding_box = await display_task
 
     consistency_flags = check_consistency(profile, vision_flags)
 
@@ -200,5 +233,6 @@ async def classify_device(
         classification=classification_result,
         consistency_flags=consistency_flags,
         report=report,
+        disclaimer=classification_result.disclaimer,
         device_bounding_box=device_bounding_box,
     )
