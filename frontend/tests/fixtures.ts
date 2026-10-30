@@ -15,6 +15,18 @@ export function tinyPngBuffer(): Buffer {
   return Buffer.from(TINY_PNG_BASE64, "base64");
 }
 
+export const SAMPLE_DISCLAIMER =
+  "This is a pre-assessment estimate, not a regulatory determination. " +
+  "Caliper does not replace the Drugs Controller General of India's " +
+  "classification authority: under the Medical Devices Rules, 2017, device " +
+  "classification is non-appealable once made. This output must not be " +
+  "represented to any regulator, customer, or third party as an official " +
+  "classification.";
+
+export const SAMPLE_REPORT_PROSE =
+  "This device is classified as Risk Class B under rule FS-B-INVASIVE-NONACTIVE, " +
+  "licensed by the State authority under Form MD-3. Clinical investigation is not required.";
+
 export function sampleClassifyResponse(
   overrides: Partial<ClassifyResponse> = {},
 ): ClassifyResponse {
@@ -26,24 +38,12 @@ export function sampleClassifyResponse(
       applicable_form: "MD-3",
       clinical_investigation_required: false,
       clinical_investigation_basis: "No novel evidence basis triggered.",
-      disclaimer:
-        "This is a pre-assessment estimate, not a regulatory determination. " +
-        "Caliper does not replace the Drugs Controller General of India's " +
-        "classification authority: under the Medical Devices Rules, 2017, device " +
-        "classification is non-appealable once made. This output must not be " +
-        "represented to any regulator, customer, or third party as an official " +
-        "classification.",
+      disclaimer: SAMPLE_DISCLAIMER,
     },
     consistency_flags: [],
-    report:
-      "This device is classified as Risk Class B under rule FS-B-INVASIVE-NONACTIVE, " +
-      "licensed by the State authority under Form MD-3. Clinical investigation is not required.\n\n" +
-      "This is a pre-assessment estimate, not a regulatory determination. " +
-      "Caliper does not replace the Drugs Controller General of India's " +
-      "classification authority: under the Medical Devices Rules, 2017, device " +
-      "classification is non-appealable once made. This output must not be " +
-      "represented to any regulator, customer, or third party as an official " +
-      "classification.",
+    // Mirrors backend/app/report/generator.py: "{prose}\n\n{disclaimer}".
+    report: `${SAMPLE_REPORT_PROSE}\n\n${SAMPLE_DISCLAIMER}`,
+    disclaimer: SAMPLE_DISCLAIMER,
     device_bounding_box: {
       x1: 20,
       y1: 15,

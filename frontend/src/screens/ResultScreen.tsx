@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { CheckCircle2, ShieldAlert } from "lucide-react";
 import { AnnotatedImage } from "@/components/AnnotatedImage";
 import { Card } from "@/components/ui/card";
@@ -22,14 +22,14 @@ export interface ResultScreenProps {
  *    "review suggested" treatment -- visually/semantically distinct
  *    from the danger-red error state -- with an explicit green
  *    no-discrepancy confirmation when the array is empty
- *  - the full report text with its disclaimer sentence in its own
+ *  - the report text, with the response's `disclaimer` field in its own
  *    bordered block
  *  - a single primary "New Measurement" action; every other element
  *    on this screen is informational, not another competing action
  */
 export function ResultScreen({ image, data, onNewMeasurement }: ResultScreenProps) {
   const [photoUrl, setPhotoUrl] = useState<string | null>(null);
-  const { classification, consistency_flags, report, device_bounding_box } = data;
+  const { classification, consistency_flags, report, disclaimer, device_bounding_box } = data;
 
   useEffect(() => {
     const url = URL.createObjectURL(image);
@@ -37,16 +37,14 @@ export function ResultScreen({ image, data, onNewMeasurement }: ResultScreenProp
     return () => URL.revokeObjectURL(url);
   }, [image]);
 
-  // Split the report body from its fixed disclaimer sentence, which
-  // backend/app/report/generator.py always appends verbatim after a
-  // blank-line separator ("{prose}\n\n{disclaimer}") -- rendering it in
-  // its own bordered block only requires splitting on that separator,
-  // never re-deriving the disclaimer text itself.
-  const [reportBody, disclaimer] = useMemo(() => {
-    const separatorIndex = report.lastIndexOf("\n\n");
-    if (separatorIndex === -1) return [report, null] as const;
-    return [report.slice(0, separatorIndex).trim(), report.slice(separatorIndex).trim()] as const;
-  }, [report]);
+  // `report` still ends with the disclaimer (for API callers that only
+  // read `report`), and the bordered block below renders the separate
+  // `disclaimer` field. To avoid showing it twice, drop that exact
+  // trailing copy from the body -- matched against the field's value,
+  // never by splitting the report text.
+  const reportBody = report.endsWith(disclaimer)
+    ? report.slice(0, report.length - disclaimer.length).trimEnd()
+    : report;
 
   return (
     <div
@@ -132,14 +130,12 @@ export function ResultScreen({ image, data, onNewMeasurement }: ResultScreenProp
           Generated report
         </h2>
         <p className="whitespace-pre-wrap text-sm text-text">{reportBody}</p>
-        {disclaimer && (
-          <div
-            className="rounded-md border border-border-strong bg-bg-subtle p-3 text-xs text-text-muted"
-            data-testid="report-disclaimer"
-          >
-            {disclaimer}
-          </div>
-        )}
+        <div
+          className="rounded-md border border-border-strong bg-bg-subtle p-3 text-xs text-text-muted"
+          data-testid="report-disclaimer"
+        >
+          {disclaimer}
+        </div>
       </Card>
 
       <Button

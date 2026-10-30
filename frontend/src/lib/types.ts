@@ -41,6 +41,8 @@ export interface ClassifyResponse {
   classification: ClassificationResult;
   consistency_flags: ConsistencyFlag[];
   report: string;
+  /** Same value as classification.disclaimer; report also still ends with it. */
+  disclaimer: string;
   device_bounding_box: DeviceBoundingBox | null;
 }
 
