@@ -20,6 +20,15 @@ admin ``reset-totp`` re-opens that same window.
 Login and TOTP attempts are throttled with the existing Valkey
 fixed-window limiter (``app.api.rate_limit.check_rate_limit``) under
 their own ``route`` keys. There is no separate lockout state.
+
+Module 6 fix #1: ``POST /auth/login`` is now throttled on two
+independent ceilings, both checked on every attempt: a tight
+``(client_ip, email)`` key at the original 10/hour (so a third party
+who knows one victim's email and rotates source IPs is still bounded
+by the previous per-email contract), and a coarser ``client_ip``-alone
+key across every email tried from that address (so a third party who
+rotates *target* emails from one IP is still caught). See
+``resolve_client_ip`` for how the client IP is resolved behind Caddy.
 """
 
 from __future__ import annotations
@@ -68,7 +77,15 @@ router = APIRouter(prefix="/api/v1/auth")
 #: A protective default, same spirit as the classify limit.
 AUTH_ATTEMPT_LIMIT_PER_HOUR = 10
 
+#: Coarser per-client-IP ceiling across *all* target emails tried from
+#: that address (Module 6 fix #1). Deliberately looser than the
+#: per-(ip, email) limit above -- it exists to catch a third party
+#: rotating target emails from one IP, not to further restrict a
+#: single legitimate user, who is already bounded by the tighter key.
+AUTH_IP_ATTEMPT_LIMIT_PER_HOUR = 50
+
 ROUTE_LOGIN = "auth-login"
+ROUTE_LOGIN_IP = "auth-login-ip"
 ROUTE_TOTP = "auth-totp"
 ROUTE_CHANGE_PASSWORD = "auth-change-password"
 
@@ -128,11 +145,42 @@ def normalize_email(email: str) -> str:
     return email.strip().lower()
 
 
-async def _throttle(request: Request, route: str, key: str) -> None:
+def resolve_client_ip(request: Request) -> str:
+    """Resolve the real client IP for login rate limiting.
+
+    Trusts exactly one ``X-Forwarded-For`` hop: Caddy is this
+    deployment's only reverse proxy, and the api container is never
+    exposed on a published port of its own (see docker-compose.yml --
+    only Caddy's 80/443 are published; ``api`` only ``expose``s 8000 on
+    the internal compose network). That means every request this
+    process sees has passed through exactly one hop, Caddy, which sets
+    (or appends to) ``X-Forwarded-For`` with the real connecting
+    client's address. Taking the last (right-most) entry is therefore
+    always the value Caddy itself added, which a client cannot spoof by
+    sending its own ``X-Forwarded-For`` header -- it can only prepend
+    to what Caddy appends, never overwrite the appended value. This
+    would NOT be safe if the api container were reachable directly, or
+    behind more than one proxy hop; either would require trusting more
+    than the single right-most entry.
+    """
+
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        candidate = forwarded_for.rsplit(",", 1)[-1].strip()
+        if candidate:
+            return candidate
+
+    client = request.client
+    return client.host if client else "unknown"
+
+
+async def _throttle(
+    request: Request, route: str, key: str, *, limit_per_hour: int = AUTH_ATTEMPT_LIMIT_PER_HOUR
+) -> None:
     result = await check_rate_limit(
         request.app.state.valkey_client,
         key,
-        limit_per_hour=AUTH_ATTEMPT_LIMIT_PER_HOUR,
+        limit_per_hour=limit_per_hour,
         route=route,
     )
     if not result.allowed:
@@ -161,7 +209,16 @@ async def _start_session(request: Request, response: Response, user: User) -> st
 @router.post("/login", response_model=LoginResponse)
 async def login(body: LoginRequest, request: Request) -> LoginResponse:
     email = normalize_email(body.email)
-    await _throttle(request, ROUTE_LOGIN, email)
+    client_ip = resolve_client_ip(request)
+    # Both ceilings are checked (and both record this attempt) on every
+    # call, regardless of which one would trigger first: the tight
+    # (client_ip, email) key at the original per-email limit, and the
+    # coarser per-client_ip key across every email tried from that
+    # address. Either one tripping is enough to throttle the request.
+    await _throttle(request, ROUTE_LOGIN, f"{client_ip}:{email}")
+    await _throttle(
+        request, ROUTE_LOGIN_IP, client_ip, limit_per_hour=AUTH_IP_ATTEMPT_LIMIT_PER_HOUR
+    )
 
     async with request.app.state.db_session_factory() as db:
         user = (await db.execute(select(User).where(User.email == email))).scalar_one_or_none()
