@@ -56,7 +56,7 @@ Python 3.12, FastAPI, SQLAlchemy 2 (async), Alembic, `uv` for dependency managem
 
 ## Security posture
 
-Encryption at rest (AES-256-GCM) and in transit (TLS, enforced end to end via Caddy). Secrets — including each deployment's Meta Model API key — held in a dedicated secrets layer, never in environment files committed to the repo or hardcoded. RBAC and TOTP MFA on every account. An append-only audit log recording who ran a classification, what was submitted, and what was returned. Dependency and container vulnerability scanning runs in CI on every change, not as a one-time check.
+Encryption at rest (Fernet -- AES-128-CBC with an HMAC-SHA256 integrity tag -- for the one encrypted column, `users.totp_secret_encrypted`) and in transit (TLS, enforced end to end via Caddy). Secrets — including each deployment's Meta Model API key — held in a dedicated secrets layer, never in environment files committed to the repo or hardcoded. RBAC and TOTP MFA on every account. An append-only audit log recording who ran a classification, what was submitted, and what was returned. Dependency and container vulnerability scanning runs in CI on every change, not as a one-time check.
 
 Caliper's security controls are built to the standard an auditor would check for SOC 2 Type II or ISO 27001 — encryption, access control, audit logging, change management. Neither certification is claimed anywhere in this project, because both are earned through an external audit observing controls operate correctly over months, not something a codebase has on day one. The architecture is built so that audit isn't blocked later; it isn't a substitute for one.
 
