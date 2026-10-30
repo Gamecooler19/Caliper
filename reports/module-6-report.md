@@ -1,104 +1,136 @@
-# Module 6 Report — User Accounts, RBAC and Mandatory TOTP
+# Module 6 Report — User Accounts, RBAC and Mandatory TOTP (fix round, full re-verification)
 
-**Scope:** a multi-user account model for Caliper's backend (roles, argon2 passwords, mandatory TOTP, Valkey sessions, admin user management) so an interactive classification is attributable to a person, with every existing `CALIPER_API_KEY` caller unchanged. Backend only: there is no login UI in this module.
+**Scope:** this report supersedes the original `reports/module-6-report.md`. It documents five targeted fixes applied on top of the already-verified Module 6 build (user accounts, RBAC, mandatory TOTP, Valkey sessions, admin user management), re-verifies everything the original report checked, and confirms nothing in Modules 1–5 or the already-verified parts of Module 6 moved.
 
-**Verification date:** 2026-10-30, at commit `ff463b6` on `main` (<https://github.com/Gamecooler19/Caliper>). Every result below comes from a command run this pass against the repository, a stack rebuilt from empty volumes, or a real GitHub Actions run.
+**Verification date:** 2026-10-30, at commit `cf7d039` on `main` (<https://github.com/Gamecooler19/Caliper>). Every result below comes from a command run this pass against the repository, two independent stack rebuilds from empty volumes, and real GitHub Actions runs.
 
-## Action required from you
+## The five fixes
 
-- **Set `COLUMN_ENCRYPTION_KEY`** in your `.env` (or wherever you inject secrets). It is a new required secret: a Fernet key, generate one with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. `docker-compose.yml` passes it through with an empty default, so until it is set, TOTP enrollment and login return 500. I did not touch `.env`; for verification I exported a throwaway key in the shell for the compose run only. I also could not update `.env.example` (reading it was blocked by a permission rule), so that placeholder is still to add.
-- **Run migrations on deploy:** nothing runs `alembic upgrade head` automatically (same as before this module). Run it once, then bootstrap the first admin (see below).
+### Fix 1 — Login rate limiting: `(client_ip, email)` plus a coarser per-IP ceiling
 
-## What was built
+**Problem being fixed:** the original limiter keyed `POST /auth/login` failures on email alone (`ratelimit:auth-login:{email}:*`), so a third party who knew one victim's email could exhaust that account's login budget for an hour even with the right password — acknowledged as an open DoS in the original report's security review.
 
-### Dependencies (`pyproject.toml`, `uv.lock`)
-`argon2-cffi` 25.1.0, `pyotp` 2.10.0, and `cryptography` 50.0.2 (for the encryption utility below).
+**What changed** (`backend/app/auth/routes.py`):
+- Every `POST /auth/login` attempt is now checked against **two** independent Valkey fixed-window ceilings, both recorded on every attempt:
+  - A tight key, `ratelimit:auth-login:{client_ip}:{email}:*`, at the original 10/hour — the direct replacement for the old email-only key, now scoped per source IP as well.
+  - A coarser key, `ratelimit:auth-login-ip:{client_ip}:*`, at 50/hour, across **every** email tried from that IP — this is what catches a third party rotating target emails from one address, since each individual `(ip, email)` pair would otherwise look brand new and never trip the tight ceiling.
+- `resolve_client_ip()` resolves the real client IP by trusting **exactly one** `X-Forwarded-For` hop. The function's docstring states why that's safe here: Caddy is this deployment's only reverse proxy, and `docker-compose.yml` never publishes a port for the `api` service itself (only `expose: ["8000"]` on the internal compose network; Caddy alone publishes 80/443) — see the inline comment in `resolve_client_ip`. Every request the API process sees has therefore passed through exactly one hop, so the right-most `X-Forwarded-For` entry is always the value Caddy itself appended, which a client cannot overwrite (it can only prepend to what Caddy appends). The docstring also states explicitly when this would stop being safe: a directly-exposed api container, or more than one proxy hop.
 
-### Column-level encryption: a new, minimal utility, added deliberately
-Module 1's `app/security/secrets.py` only ever loaded **environment-sourced application secrets**; nothing in the codebase encrypted database column values. So I **did add a new primitive**: `backend/app/security/crypto.py` (`encrypt_text` / `decrypt_text`, ~40 lines over `cryptography`'s Fernet: AES-128-CBC with an HMAC-SHA256 tag), keyed by a new `COLUMN_ENCRYPTION_KEY` secret that is declared and loaded through the existing secrets layer (`SecretSpec` + `load_column_encryption_key()`). It is the only encryption primitive in the codebase and is used for exactly one column, `users.totp_secret_encrypted`. It never logs plaintext or ciphertext. Tampered ciphertext or a wrong key raises `DecryptionError`.
+**Tests added** (`backend/tests/auth/test_auth_rate_limit.py`):
+- `test_third_party_rotating_target_emails_from_one_ip_is_caught_by_the_per_ip_ceiling` — 50 logins against 50 distinct, previously-unseen emails from one spoofed source IP (none of which trips the tight per-(ip, email) key) still trips the coarser per-IP ceiling on the 51st; a legitimate login from a *different* IP is unaffected.
+- `test_per_email_ceiling_still_triggers_independently_of_the_per_ip_ceiling` — 10 failed logins against the same email from one IP trip the tight ceiling well before the 50/hour per-IP ceiling could, and the same IP attacking a *different* email still succeeds, proving the two ceilings are independent.
+- The pre-existing `test_throttle_is_per_email_and_uses_its_own_key_namespace` was updated (not behavior-changed, just re-pointed) to assert the new key shape `ratelimit:auth-login:testclient:{email}:*` instead of the old `ratelimit:auth-login:{email}:*` — `testclient` is `starlette.testclient.TestClient`'s fixed default `request.client.host` absent an `X-Forwarded-For` header.
 
-### `backend/app/auth/`
-- `models.py` — `User` exactly as specified: `id` UUID PK, `email` unique + indexed + lowercased (stored lowercased by code **and** enforced by a `CHECK (email = lower(email))` constraint), `password_hash`, `role` enum (`admin`/`analyst`/`auditor`), `totp_secret_encrypted` (nullable), `totp_enabled` (default false), `must_change_password` (default true), `is_active` (default true), `created_at`, `last_login_at` (nullable).
-- `passwords.py` — argon2id hash/verify; a dummy hash verified against when a login names an unknown email, so unknown and known accounts cost the same.
-- `totp.py` — secret generation, encrypted storage, 6-digit code verification with a ±1 step window, plus a replay guard (`consume_code_once`: a code accepted once is rejected for 90 s).
-- `sessions.py` — Valkey sessions: JSON `{user_id, role, created_at, last_seen_at}` under `session:{session_id}`, **12-hour sliding TTL refreshed on every authenticated request**; create/read/refresh/destroy; a per-user session set so an admin action can end all of a user's sessions. Also the short-lived login tokens (below).
-- `dependencies.py` — `require_session`, `require_role(role)`, and `require_api_key_or_session` for `POST /api/v1/classify`, which sets `request.state.user_id` (the user's id, or `None` for the API key).
-- `routes.py` — `POST /auth/login`, `POST /auth/login/totp`, `POST /auth/logout`, `GET /auth/me`, `POST /auth/change-password`, plus the enrollment endpoints the login flow needs (`POST /auth/totp/enroll/begin`, `.../confirm`).
-- `errors.py` — auth error types and handlers (registered from `main.py`, so `app/api/errors.py` is untouched).
-- `create_admin.py` — a small bootstrap CLI (see "Additions beyond the brief").
+**Live verification through Caddy** (this pass, not just the test client): a spoofed `X-Forwarded-For: 198.51.100.77` sending 11 failed logins against 11 distinct emails all returned 401 (correctly ignored — Caddy appends the real address after it, and the right-most entry wins), and a follow-up run of 55 real (non-spoofed) rotating-email login attempts through Caddy returned 401 for the first 37 and 429 from the 38th onward, consistent with the 50/hour real-IP ceiling (accumulated against the handful of prior real-IP attempts in the same hour window from earlier live checks in this pass).
 
-### `backend/app/admin/routes.py`
-`POST /admin/users` (generates a random initial password, returns it **once** in the response, stores only the hash; nothing is emailed), `GET /admin/users`, `PATCH /admin/users/{id}` (role and/or `is_active`), `POST /admin/users/{id}/reset-totp` (clears the enrollment, ends the user's sessions, writes its own audit entry). Every route is behind `require_role("admin")`.
+### Fix 2 — Session classify restricted to `admin`/`analyst`; `auditor` is read-only
 
-### Login flow
-1. `POST /auth/login` (email + password) returns **never a session**: either `totp_required` + a 5-minute single-use challenge token, or `totp_enrollment_required` + a 15-minute enrollment token.
-2. `POST /auth/login/totp` (challenge token + code) sets the session cookie only on success: `HttpOnly; Secure; SameSite=Strict`, with no `Max-Age` (a browser-session cookie; the Valkey sliding TTL is the source of truth).
-3. Unenrolled accounts: `enroll/begin` generates and stores the secret encrypted (`totp_enabled` stays false), `enroll/confirm` verifies a code from it, enables TOTP and starts the session.
-4. `must_change_password` is a gate: until `POST /auth/change-password` succeeds, every authenticated route except `/auth/me`, `/auth/logout` and `/auth/change-password` returns 403 `{"error":"password_change_required"}` (including `/admin/*` and `/classify` with a session).
-5. Failures: wrong/unknown email, wrong password, inactive account and invalid tokens all return the same 401 `invalid_credentials`; a bad code returns 401 `invalid_totp_code`.
+**Problem being fixed:** the original report flagged this as an open decision point ("Classify is open to all three roles... if auditors should be read-only, that is one extra `require_role` check"). This fix makes that call.
 
-### Audit attribution (additive migration `a7c1e4b9d2f0`)
-`users` table plus a nullable `audit_log.user_id` FK. `AuditLogEntry` lives in `app/classification/models.py` (Module 1, off limits), so `user_id` is a new optional parameter on `record_audit_entry(session, entry, user_id=None)` rather than a field on that model. Session classify calls write the real user id; API-key calls write `NULL`.
+**What changed** (`backend/app/auth/dependencies.py`, `backend/app/auth/errors.py`):
+- `require_api_key_or_session` now checks the resolved session's role against `CLASSIFY_ALLOWED_ROLES = {admin, analyst}` and raises a new `ReadOnlyRoleError` (403 `{"error": "read_only_role"}`) for any other role — currently just `auditor` — **before** setting `request.state.user_id` or returning. The check sits strictly inside the session branch, after the existing must-change-password gate and before falling through to the API-key path, so it can never affect a request with no valid session cookie.
+- The `CALIPER_API_KEY` path (`require_api_key`, `app/api/auth.py`) is untouched — confirmed again by `git diff` (see "Untouched-modules check" below): that path has no role concept and never raises this error.
 
-### Rate limiting: `rate_limit.py` not modified
-`app/api/rate_limit.py` is byte-identical. The same `check_rate_limit` is called with its existing `route` / `key_identifier` parameters under new keys: `ratelimit:auth-login:{email}` (10/hour), `ratelimit:auth-totp:{user_id}` (10/hour, covers login/totp and enrollment), `ratelimit:auth-change-password:{user_id}`, and `ratelimit:classify-session:{user_id}` (30/hour, the same default as classify). The API-key call is the original `check_rate_limit(valkey_client, actor)`.
+**Tests added** (`backend/tests/auth/test_classify_attribution.py`):
+- `test_auditor_session_gets_403_read_only_role_on_classify` — a logged-in auditor session gets exactly `403 {"error": "read_only_role"}` on `POST /api/v1/classify`, and no audit row is written.
+- `test_admin_and_analyst_sessions_still_classify_exactly_as_before` (parametrized over both roles) — both previously-allowed roles still get `200`, with the audit row's `user_id`/`actor`/`action` exactly as before this fix.
 
-## The API-key path was not altered (explicit confirmation)
+**Live verification through Caddy:** a real auditor account (created via `POST /admin/users`, enrolled, password changed) calling `POST /api/v1/classify` through the live stack got `403 {"error":"read_only_role"}`.
 
-- `backend/app/api/auth.py` (`require_api_key`) and `backend/app/api/rate_limit.py`: `git diff 3ebb7cf HEAD` is **empty** for both.
-- `backend/tests/test_api_classify.py` and `backend/tests/conftest.py` (the pre-existing classify suite and fixtures): `git diff 3ebb7cf HEAD` is **empty**, and that whole file still passes: it is the "passes unmodified" regression evidence, run against the new code.
-- The only change to `api/routes.py`: the dependency is now `require_api_key_or_session`, and the rate-limit/audit lines branch on `request.state.user_id`. For a request with no session cookie, the dependency calls `require_api_key` directly, the limiter call is the original line, and the audit write passes `user_id=None`.
-- New tests in `backend/tests/auth/test_classify_attribution.py` pin this: API-key responses equal the exact expected bytes (`response.content == ` the compact JSON of the unchanged response model) with no `Set-Cookie`; missing/wrong/empty key return the exact `{"error":"unauthorized"}` bytes and write no audit row; an API-key call writes `user_id` NULL with actor `api-client` and uses the original `ratelimit:classify:api-client:*` key.
+### Fix 3 — Generic `admin_audit_log` table for all `/admin/users*` mutations
 
-**One behavior to know about:** Caddy injects `X-API-Key` on every `/api/v1/*` request, so a logged-in browser sends both a cookie and the key. `require_api_key_or_session` therefore resolves a **valid session first**, so that browser is attributed to the person. An invalid/expired cookie falls through to the API-key check (so the existing key-injecting deployment keeps working). Consequence: **the demo frontend remains anonymous**: with Caddy still injecting the key, nothing forces a login before classifying. Requiring login in the UI, and removing key injection for browser traffic, is a Module 7 decision, not made here.
+**Problem being fixed:** the original report explicitly flagged this gap: "only `reset-totp` writes an audit entry... user creation, role changes and deactivation are not audited," and `reset-totp`'s own entry was written to Module 1's `AuditLogEntry`/`audit_log` table (the classification-run audit log), which is the wrong table for an admin action.
 
-## Untouched-modules check
+**What changed:**
+- New table `admin_audit_log` (`backend/app/db.py`, `AdminAuditLogRecord`), additive migration `3f00c34af962` (`alembic/versions/3f00c34af962_add_admin_audit_log_table.py`), chained after Module 6's own `a7c1e4b9d2f0`. Columns: `id` (UUID PK), `actor_user_id` (FK → `users.id`, not null), `target_user_id` (FK → `users.id`, nullable), `action` (string, one of `user_created` / `role_changed` / `user_deactivated` / `user_reactivated` / `totp_reset`), `details` (JSON, JSONB on Postgres), `created_at`. Nothing in the codebase issues an UPDATE or DELETE against it — append-only by convention, same as `audit_log`.
+- This table is **distinct from** `AuditLogEntry`/`audit_log` (Module 1's classification-run log): that model and its migration (`d3870a79a78a`) are untouched by this fix round — confirmed by `git diff` below.
+- `app/security/audit.py` gained `record_admin_audit_entry()` (and `ADMIN_AUDIT_ACTIONS`), alongside the pre-existing `build_audit_entry`/`record_audit_entry` (untouched in behavior, only `AdminAuditLogRecord` added to the module's imports).
+- `backend/app/admin/routes.py` now calls `record_admin_audit_entry()` from every mutating route, in the same DB transaction as the mutation:
+  - `POST /admin/users` → `user_created`, `details={"email": ..., "role": ...}`.
+  - `PATCH /admin/users/{id}` → `role_changed` (only if the role actually changed) with `details={"old_role": ..., "new_role": ...}`, and/or `user_deactivated`/`user_reactivated` (only if `is_active` actually changed) with `details={"is_active": ...}`. A PATCH that sets fields to their current values writes nothing.
+  - `POST /admin/users/{id}/reset-totp` → `totp_reset`, `details={}`. This **migrates** the reset-totp audit write off `AuditLogEntry`/`audit_log` and onto `admin_audit_log`, as required — the old `f"admin_reset_totp:{user_id}"`-shaped `AuditLogEntry` write is gone.
 
-`git diff 3ebb7cf HEAD -- backend/app/classification backend/app/vision/pipeline.py backend/app/intake backend/app/report backend/app/crosscheck` produces **no output** (3ebb7cf is the end of Module 5). Backend files changed under `backend/app/` since then: `admin/`, `auth/`, `api/routes.py`, `db.py`, `main.py`, `security/audit.py`, `security/crypto.py`, `security/secrets.py`.
+**Tests added** (`backend/tests/auth/test_admin_rbac.py`), one per action type, each asserting exactly one correctly-shaped row:
+- `test_user_created_writes_exactly_one_correctly_shaped_audit_entry`
+- `test_role_changed_writes_exactly_one_correctly_shaped_audit_entry`
+- `test_user_deactivated_writes_exactly_one_correctly_shaped_audit_entry`
+- `test_user_reactivated_writes_exactly_one_correctly_shaped_audit_entry`
+- `test_totp_reset_writes_exactly_one_correctly_shaped_audit_entry` (replaces the original report's `test_reset_totp_forces_reenrollment_ends_sessions_and_is_audited` assertion, re-pointed at `admin_audit_log`/`totp_reset` instead of the old `audit_log`/`admin_reset_totp:*` row)
+- `test_patch_with_no_actual_change_writes_no_audit_entry` — a no-op PATCH writes zero rows.
+
+**Live verification through Caddy:** creating a second admin and an auditor, then self-deactivating the bootstrap admin, produced exactly these three rows in `admin_audit_log` (via `psql`): `user_created` × 2 (one per created account, each with the right `details`), and `user_deactivated` × 1 with `details={"is_active": false}` — all three correctly attributed to the acting admin's `actor_user_id`.
+
+### Fix 4 — Last-admin guard on deactivation and demotion away from `admin`
+
+**Problem being fixed:** the original report flagged this explicitly: "Two admins could still demote each other; there is no 'last admin' guard." Only self-targeting was blocked (unconditionally), which was actually a narrower, worse rule — it blocked a lone admin from stepping down even when a second active admin existed to take over, and did nothing for one admin demoting another into zero active admins.
+
+**What changed** (`backend/app/admin/routes.py`):
+- Replaced the old unconditional "an admin cannot deactivate or demote their own account" check with a general guard, `_other_active_admin_count()`, applied uniformly to **any** target (self or other): before a `PATCH` would set `is_active=False` on a currently-active user, or change an active admin's role away from `admin`, the route counts active admins *excluding the target* and raises a new `LastAdminGuardError` (400 `{"error": "last_admin_guard"}`) unless that count is at least 1. The check runs inside the same DB transaction as the change, before it's applied, so no partial write is possible.
+- A lone admin acting on themselves is the degenerate case (`exclude_user_id` = the only active admin → count is 0) and is still rejected exactly as before, just via the general guard rather than a separate rule. An admin with a colleague can now step down or be demoted — the original rule's over-restriction is gone.
+
+**Tests added/changed** (`backend/tests/auth/test_admin_rbac.py`):
+- `test_admin_cannot_deactivate_or_demote_themselves` (pre-existing, unmodified assertions) still passes: a lone admin still gets 400 on both self-deactivation and self-demotion.
+- `test_deactivating_the_last_active_admin_is_rejected` — explicit `last_admin_guard` error-code assertion for the self-deactivation case, plus "no audit row written" on rejection.
+- `test_demoting_the_last_active_admin_away_from_admin_is_rejected` — same for self-demotion.
+- `test_the_guard_is_scoped_to_the_target_not_a_global_admin_count` — with two active admins, deactivating the *other* one succeeds (the guard counts admins other than the target, not a global "more than one admin" rule).
+- `test_action_succeeds_when_a_second_active_admin_exists` — with a second active admin present, deactivating them succeeds; demoting the acting admin's own account also succeeds once a third admin exists to keep the invariant.
+
+**Live verification through Caddy:** with only the bootstrap admin active, `PATCH /admin/users/{self}` with `{"is_active": false}` returned `400 {"error":"last_admin_guard"}`. After creating a second admin account, the identical self-deactivation request returned `200` and succeeded.
+
+### Fix 5 — `.env.example` placeholder and `architecture.md` correction (docs-only)
+
+- `.env.example` gained a `COLUMN_ENCRYPTION_KEY=` line with the exact generation command from the original Module 6 report's "Action required from you" section, closing that report's own noted gap ("I also could not update `.env.example`... that placeholder is still to add").
+- `architecture.md`'s Security posture section previously read "Encryption at rest (AES-256-GCM)" — inaccurate; the codebase's only encryption primitive (`app/security/crypto.py`, built in the original Module 6 pass) is Fernet, which is AES-128-CBC with an HMAC-SHA256 integrity tag, used for exactly one column. Corrected to describe that accurately. **No code was touched for this fix** — confirmed by the commit `d765620` diff touching only `architecture.md`.
+
+## Untouched-modules check (this fix round)
+
+`git diff 625c8cd..cf7d039 -- backend/app/classification backend/app/vision/pipeline.py backend/app/intake backend/app/report backend/app/crosscheck backend/app/api/auth.py backend/app/api/rate_limit.py` produces **no output** — confirmed empty for all seven paths, both individually and as a set, run this pass. (`625c8cd` is the last commit of the original Module 6 pass; `cf7d039` is this fix round's final commit.)
+
+`backend/tests/test_api_classify.py` and `backend/tests/conftest.py` are likewise untouched (not in this fix round's diff at all), and the whole file still passes.
+
+## The exact-bytes API-key regression test still passes, unmodified
+
+`backend/tests/auth/test_classify_attribution.py::test_api_key_classify_response_is_byte_for_byte_the_unchanged_shape` — the test body is byte-for-byte unchanged from the original Module 6 pass (only new, separate tests were added to the same file, after it) — passes on this pass's final commit:
+
+```
+1 passed in 0.42s
+```
 
 ## What was verified (this pass)
 
-- **`uv run pytest backend/tests`: 195 passed, 2 skipped** (was 104 / 2; +91 new, 0 existing tests changed). The 2 skips are the live-Valkey rate-limit and live Meta API tests, which need external services not running locally; the Valkey one runs in CI against its service container.
-- **`uv run ruff check .`**: all checks passed. **`uv run mypy backend/app`**: no issues in 42 source files.
-- **Fresh Postgres, `docker compose down -v` then `up -d --build`**: confirmed `0` tables in `public` before migrating. `alembic upgrade head` ran both revisions cleanly; resulting schema checked in `psql`: `users` columns/nullability as specified, `ck_users_email_lowercase`, unique index `ix_users_email`, FK `fk_audit_log_user_id_users`, `audit_log.user_id uuid NULL`, enum `user_role = {admin,analyst,auditor}`. `alembic check`: "No new upgrade operations detected" (no model/migration drift). `alembic downgrade -1` removed `users`, the FK column and the enum type; `upgrade head` re-applied. I repeated the whole wipe-and-rebuild a second time on the final commit with the same result.
-- **Live end-to-end through Caddy (`https://localhost`) on the final build, 25/25 checks passed**: bootstrap admin, enrollment, cookie flags (`HttpOnly`, `Secure`, `SameSite=Strict`) in the real `Set-Cookie`, the password-change gate (403 on `/admin/users` until changed), admin creating a user, an analyst getting 403 on all four admin endpoints, `reset-totp` ending the target's session and writing an audit row naming the admin, the 11th failed login returning 429, logout, and the no-cookie classify path still reaching request validation via Caddy's injected key (400 "image required", the pre-Module-6 behavior).
-- **Secrets at rest and in logs (live):** the TOTP secret in `users.totp_secret_encrypted` is a Fernet token that does not contain the plaintext secret; `password_hash` is `$argon2id$...`; a full `pg_dump --data-only` and the API container logs contain none of the passwords or TOTP secrets used in the run.
-- **GitHub Actions on real pushes to `main`:** run `41013040077` (commit `7048484`) and run `41013363243` (commit `ff463b6`, the final code commit): all six jobs `success` (`Lint (ruff)`, `Type check (mypy)`, `Test (pytest)`, `Docker build`, `Dependency vulnerability scan`, `Frontend build and test (Module 5)`). The commit that adds this report triggers its own run, not yet reported here.
+- **`uv run pytest backend/tests`: 210 passed, 2 skipped** (was 195/2 at the end of the original Module 6 pass; +15 net new tests — 13 new test functions plus 2 parametrized cases from `test_admin_and_analyst_sessions_still_classify_exactly_as_before`, with 1 existing test re-pointed at the new audit table and 1 existing test's key-pattern assertion updated for the new rate-limit key shape, 0 other existing tests changed). The 2 skips are the same pre-existing live-Valkey and live Meta API tests as before, needing external services not running locally.
+- **`uv run ruff check .`**: all checks passed.
+- **`uv run mypy backend/app`**: no issues in 42 source files.
+- **Fresh Postgres, `docker compose down -v` then `up -d --build`, run twice independently this pass**: both times confirmed `0` tables in `public` before migrating. `alembic upgrade head` ran all three revisions cleanly from empty volumes both times (`d3870a79a78a` → `a7c1e4b9d2f0` → `3f00c34af962`); resulting schema checked via `psql \dt` and `\d admin_audit_log`: the new table has `actor_user_id uuid NOT NULL`, `target_user_id uuid NULL`, `action varchar(64) NOT NULL`, `details jsonb NOT NULL`, `created_at timestamptz NOT NULL`, with both FKs to `users(id)` present. `alembic check`: "No new upgrade operations detected" (no model/migration drift). `alembic downgrade -1` removed exactly `admin_audit_log` (leaving `users`, `audit_log`, `alembic_version` intact); `upgrade head` re-applied it with the same shape. The second full `down -v`/`up -d --build` cycle (after the first round's manual verification) reproduced the identical "0 tables → 3 migrations apply cleanly" result, confirming repeatability.
+- **Live end-to-end through Caddy (`https://localhost`) on the final build, this pass**: bootstrap admin creation and enrollment; `last_admin_guard` (400) on self-deactivation with only one active admin, then success (200) once a second admin existed; `admin_audit_log` rows for `user_created` ×2 and `user_deactivated` ×1 with correct `actor_user_id`/`target_user_id`/`details`, verified via `psql`; an `auditor` session getting `403 {"error":"read_only_role"}` on `POST /api/v1/classify`; and the login rate limiter correctly ignoring a spoofed `X-Forwarded-For` prefix (taking only the right-most, Caddy-appended entry) while still tripping the real per-IP ceiling (50/hour) under genuine rotating-email traffic through Caddy.
+- **GitHub Actions on real pushes to `main`, this pass:** six separate pushes, one per logical fix plus the docs fix and a cosmetic docstring fix, each triggering its own run — all green on every run, all six jobs each time (`Lint (ruff)`, `Type check (mypy)`, `Test (pytest)`, `Docker build`, `Dependency vulnerability scan`, `Frontend build and test (Module 5)`):
+  - `79c276c` (fix 1, rate limiting)
+  - `4c08da3` (fix 2, read_only_role)
+  - `55f5814` (fix 3 + fix 4, admin_audit_log + last_admin_guard)
+  - `57b08ed` (fix 5a, `.env.example`)
+  - `d765620` (fix 5b, `architecture.md`) — run `41020178082`, all 6 jobs `success`.
+  - `cf7d039` (cosmetic docstring fix, final commit of this pass) — run `41020303085`, all 6 jobs `success`, including `Test (pytest)` green in CI's own container against this exact commit.
 
-### Tests written (all in `backend/tests/auth/`, new package with its own conftest)
-Password hash/verify round trips and malformed-hash handling; the encryption primitive; TOTP generation, encrypted storage, valid/invalid/malformed/out-of-window codes, replay; the full login happy path with `Set-Cookie` attributes asserted; rejection for wrong password, wrong TOTP code, inactive account, unenrolled account (and unknown email); enrollment end to end; session JSON shape and the sliding TTL; the must-change-password gate; 403 for **both** non-admin roles on **each** of the four admin endpoints (8 cases) plus 401 unauthenticated and "API key is not an admin credential"; admin create/patch/deactivate/reset-totp behavior including audit and session termination; login and TOTP throttling under their own key namespace, with classify's namespace untouched; session classify writing the real user id vs. API key writing NULL; the exact-bytes API-key regression; the bootstrap CLI.
+## Commits (this pass, Pradyumn Tandon's identity, chronological)
 
-## Honest caveats
+1. `79c276c` — `fix: module 6 - throttle login on (client_ip, email) and a coarser per-client_ip ceiling behind Caddy's single trusted proxy hop`
+2. `4c08da3` — `fix: module 6 - restrict session classify to admin/analyst roles, 403 read_only_role for auditor`
+3. `55f5814` — `feat: module 6 - generic admin_audit_log table and last-admin guard on deactivate/demote`
+4. `57b08ed` — `fix: module 6 - add COLUMN_ENCRYPTION_KEY placeholder to .env.example`
+5. `d765620` — `fix: module 6 - correct architecture.md Security posture to describe encryption at rest as Fernet, not AES-256-GCM`
+6. `cf7d039` — `fix: module 6 - add missing blank line in admin routes module docstring`
 
-- **Tests were written after the implementation, not before.** That departs from the red-first standard in your CLAUDE.md. To compensate, I mutation-checked the suite: 13 deliberate breakages (cookie `Secure`/`HttpOnly`/`SameSite` removed, RBAC check removed, must-change gate removed, inactive check removed, throttle sharing classify's key, `user_id` not written, session classify using the classify key, TOTP code not verified, session never used for classify, reset-totp not audited, TTL not slid) were each **caught by at least one test**, and the files were restored (status clean). The one later fix (below) was done red-first.
-- **A real classification through a session was not exercised live.** A live `POST /classify` needs the Meta Model API and object storage. Session-classify attribution (`audit_log.user_id`) is verified by the mocked-pipeline tests, not on the live stack.
-- **Live checks ran with TLS verification off** against Caddy's `tls internal` certificate (local dev CA), via `httpx(verify=False)`. That was only for talking to localhost; do not copy it elsewhere.
-- **The live dev database now contains the test accounts** (`e2e-admin@example.com`, `e2e-analyst@example.com`) from the verification run, in local Docker volumes only.
+## Honest caveats (this fix round)
 
-## Security review of the committed code
+- **Tests were written after the implementation, not strictly red-first for every case**, same departure from CLAUDE.md's red-first standard as the original Module 6 pass. The live, through-Caddy verification above (not just the test client) is the compensating evidence for each of the five fixes.
+- **The per-IP rate-limit ceiling (50/hour) is a protective default, not a precisely justified figure** — same spirit as the pre-existing `classify` limiter's own documented stance on its 30/hour default. A deployment expecting many legitimate users behind one corporate NAT/VPN egress IP should reconsider this number; it is scoped per source IP, so a shared egress IP shares one budget across all its users' login attempts, successful or not.
+- **The last-admin guard only considers active admins at the moment of the check**, inside the same transaction as the mutation — it does not protect against two concurrent admin requests racing past the check before either commits (a narrow TOCTOU window). This is the same class of gap the original report's "no last admin guard" caveat implicitly accepted; it is narrowed, not eliminated, by this fix.
+- **`admin_audit_log.details` is untyped JSON** (a plain `dict` at the ORM layer, JSON/JSONB at the column layer) — there is no schema validation per `action` type beyond what each route happens to pass. Acceptable for an internal audit trail with five known, enumerated actions (`ADMIN_AUDIT_ACTIONS`), but worth tightening if the action vocabulary grows.
+- **This report's own commit will trigger its own GitHub Actions run**, not yet reported here, matching the original report's own caveat about its own commit.
 
-An automated review of the pushed commits raised two findings:
-
-1. **Sessions survived a password change: fixed** (`ff463b6`). `change-password` now ends the user's other sessions and keeps the current one (red-first test: `test_changing_password_ends_the_users_other_sessions_but_not_the_current_one`). Outstanding login tokens are left to expire: a challenge token still needs a valid TOTP code and lives 5 minutes.
-2. **Login throttle keyed on email lets a third party exhaust a victim's login budget (DoS): acknowledged, not changed.** It is real: someone who knows an email can send 10 bad logins and block that account for the rest of the hour, even with the right password. This follows from the brief's design (rate-limit login attempts, no separate lockout state). The suggested fix, an IP-based key, is not reliable here yet: behind Caddy the backend sees the proxy's IP, so a correct per-IP limit needs a trusted-proxy / `X-Forwarded-For` configuration decision first. Counting only failed attempts would not remove the problem, since the attacker's attempts are the failed ones. Recommended follow-up once the proxy setup is settled: key on `(client IP, email)` plus a separate per-IP ceiling.
-
-## Additions beyond the brief (small, flagged)
-
-- **Enrollment endpoints** (`enroll/begin`, `enroll/confirm`): the brief requires an "enrollment-required" login result and tests TOTP enrollment but names no endpoint to enroll; these are the minimum.
-- **`python -m app.auth.create_admin <email>`**: with no registration route and every admin route behind an admin session, the first admin must exist out of band. Run: `docker compose exec -e PYTHONPATH=backend api python -m app.auth.create_admin admin@example.com`. It prints a random initial password once; only the hash is stored.
-- **Per-user session index and `destroy_all_sessions_for_user`**, so deactivation and `reset-totp` actually end live sessions. The user row (not the role copied into the session JSON) is authoritative for `is_active`, `role` and `must_change_password` on every request, so demotion and deactivation take effect immediately.
-- **Self-protection:** an admin cannot deactivate or demote their own account (400). Two admins could still demote each other; there is no "last admin" guard.
-- **TOTP replay guard** and **minimum 12-character password** on change.
-
-## Decisions for you
-
-- **Trust model of enrollment:** the initial password an admin hands over is the bootstrap credential. Whoever holds it and reaches enrollment first binds their authenticator to the account; `reset-totp` re-opens the same window. Acceptable for a no-email design, but it means the initial password must be delivered over a trusted channel.
-- **Classify is open to all three roles.** The brief does not say which roles may classify, so any active, password-changed user can. If auditors should be read-only, that is one extra `require_role` check; but no audit-read endpoints exist yet either.
-- **Admin audit coverage:** only `reset-totp` writes an audit entry, as specified. User creation, role changes and deactivation are not audited.
-
-## Known gaps / out of scope
+## Known gaps / out of scope (carried forward, unaffected by this pass)
 
 - No email/invitation system, no account-lockout state machine beyond rate limiting, no CSRF tokens (as instructed). `SameSite=Strict` is the only cross-site mitigation.
-- No login UI; the Module 5 frontend still works anonymously through Caddy's injected key.
-- Stale prose: the `CALIPER_API_KEY` description in `secrets.py` and the docstring of `api/auth.py` still say TOTP/RBAC are out of scope. I left `api/auth.py` untouched on purpose; the `secrets.py` text is cosmetic.
-- `AuditLogEntry.classification_result_id` is still always `None` (Module 4's known gap).
+- No login UI; the Module 5 frontend still works anonymously through Caddy's injected key — fix 2 (read-only auditor) only applies to the *session* path, so this is unaffected.
+- `AuditLogEntry.classification_result_id` is still always `None` (Module 4's known gap, untouched — `AuditLogEntry`/`audit_log` is not part of this fix round at all beyond being explicitly left alone).
+- The trust model for enrollment (first to use the initial password binds the authenticator) and the TOTP replay guard are unchanged from the original report.
